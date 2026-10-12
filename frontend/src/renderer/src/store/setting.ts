@@ -14,8 +14,15 @@ export const defaultScreenSettings = {
 
 export type ScreenSettings = typeof defaultScreenSettings;
 
+export const defaultGeneralSettings = {
+  autoCheckUpdate: false
+};
+
+export type GeneralSettings = typeof defaultGeneralSettings;
+
 const initialState = {
-  screenSettings: defaultScreenSettings
+  screenSettings: defaultScreenSettings,
+  generalSettings: defaultGeneralSettings
   // other settings...
 }
 
@@ -25,10 +32,13 @@ const settingSlice = createSlice({
   reducers: {
     setScreenSettings(state, action: PayloadAction<Partial<ScreenSettings>>) {
       state.screenSettings = { ...state.screenSettings, ...action.payload }
+    },
+    setGeneralSettings(state, action: PayloadAction<Partial<GeneralSettings>>) {
+      state.generalSettings = { ...defaultGeneralSettings, ...state.generalSettings, ...action.payload }
     }
   }
 })
 
-export const { setScreenSettings } = settingSlice.actions
+export const { setScreenSettings, setGeneralSettings } = settingSlice.actions
 
 export default settingSlice.reducer

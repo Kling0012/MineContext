@@ -47,14 +47,16 @@ export async function APIChatHandler(req: Request, res: Response) {
     //   baseURL: "https://ark.cn-beijing.volces.com/api/v3",
     // });
     const openai = createOpenAICompatible({
-      baseURL: 'https://ark.cn-beijing.volces.com/api/v3',
+      // No Ark endpoint is baked in anymore; configure via env when this legacy
+      // server is ever used.
+      baseURL: process.env.ARK_BASE_URL || '',
       name: 'ark',
-      apiKey: ''
+      apiKey: process.env.ARK_API_KEY || ''
     })
     // const openai = createOpenAI({
     // });
 
-    const newMessages = convertToModelMessages(messages)
+    const newMessages = await convertToModelMessages(messages)
 
     console.log(JSON.stringify(newMessages))
     const result = streamText({

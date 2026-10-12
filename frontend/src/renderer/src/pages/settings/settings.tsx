@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { FC, useMemo, useEffect } from 'react'
-import { Form, Button, Select, Input, Typography, Spin, Message } from '@arco-design/web-react'
+import { Form, Button, Select, Input, Typography, Spin, Message, Switch } from '@arco-design/web-react'
 import { find, get, isEmpty, pick } from 'lodash'
 
 import ModelRadio from './components/modelRadio/model-radio'
 import { ModelTypeList, BaseUrl, embeddingModels, ModelInfoList } from './constants'
 import { getModelInfo, ModelConfigProps, updateModelSettingsAPI } from '../../services/Settings'
 import { useMemoizedFn, useMount, useRequest } from 'ahooks'
+import { useSetting } from '@renderer/hooks/use-setting'
 
 const FormItem = Form.Item
 const { Text } = Typography
@@ -148,6 +149,31 @@ const StandardFormItems: FC<StandardFormItemsProps> = (props) => {
         ]}>
         <Select allowCreate placeholder="please select" options={option} className="!w-[574px]" />
       </FormItem>
+      {modelPlatform === ModelTypeList.Doubao && (
+        <FormItem
+          requiredSymbol={false}
+          label="Base URL"
+          field={`${prefix}-baseUrl`}
+          extra={
+            <div className="text-[12px] text-[#6E718C]">
+              No default endpoint is preset. For a Volcengine Ark account use e.g.
+              https://ark.cn-beijing.volces.com/api/v3
+            </div>
+          }
+          rules={[
+            {
+              validator(value, callback) {
+                if (!value) {
+                  callback('Please enter your base URL')
+                } else {
+                  callback()
+                }
+              }
+            }
+          ]}>
+          <Input allowClear placeholder="Enter your base URL" className="!w-[574px]" />
+        </FormItem>
+      )}
       <FormItem
         requiredSymbol={false}
         label="API Key"
@@ -208,6 +234,7 @@ const Settings: FC<SettingsProps> = (props) => {
   const { closeSetting, init } = props
 
   const [form] = Form.useForm<SettingsFormProps>()
+  const { autoCheckUpdate, setGeneralSettings } = useSetting()
   const { run: getInfo, loading: getInfoLoading, data: modelInfo } = useRequest(getModelInfo, { manual: true })
 
   const { run: updateModelSettings, loading: updateLoading } = useRequest(updateModelSettingsAPI, {
@@ -250,7 +277,10 @@ const Settings: FC<SettingsProps> = (props) => {
         ? formatData
         : {
             ...formatData,
-            baseUrl: values.modelPlatform === ModelTypeList.Doubao ? BaseUrl.DoubaoUrl : BaseUrl.OpenAIUrl,
+            // No provider-specific default URL is forced for Doubao: the base
+            // URL must be entered explicitly (empty until configured).
+            baseUrl:
+              values.modelPlatform === ModelTypeList.Doubao ? formatData.baseUrl || '' : BaseUrl.OpenAIUrl,
             embeddingModelId:
               values.modelPlatform === ModelTypeList.Doubao
                 ? embeddingModels.DoubaoEmbeddingModelId
@@ -297,9 +327,7 @@ const Settings: FC<SettingsProps> = (props) => {
               layout={'vertical'}
               form={form}
               initialValues={{
-                modelPlatform: ModelTypeList.Doubao,
-                [`${ModelTypeList.Doubao}-modelId`]: 'doubao-seed-1-6-flash-250828',
-                [`${ModelTypeList.OpenAI}-modelId`]: 'gpt-5-nano'
+                modelPlatform: ModelTypeList.Custom
               }}>
               <FormItem label="Model platform" field={'modelPlatform'} requiredSymbol={false}>
                 <ModelRadio />
@@ -326,6 +354,21 @@ const Settings: FC<SettingsProps> = (props) => {
                 {init ? 'Get started' : 'Save'}
               </Button>
             </Spin>
+            <div className="mt-[32px] pt-[16px] border-t border-[#E5E6EB]">
+              <div className="mb-[12px] text-[16px] font-medium text-[#0B0B0F]">Application</div>
+              <div className="mb-[4px] flex items-center justify-between">
+                <span className="text-[14px] text-[#0B0B0F]">Automatically check for updates</span>
+                <Switch
+                  size="small"
+                  checked={autoCheckUpdate}
+                  onChange={(v) => setGeneralSettings({ autoCheckUpdate: v })}
+                />
+              </div>
+              <Text type="secondary" className="text-[12px]">
+                Off by default. When enabled, MineContext checks for updates from GitHub releases on
+                startup and downloads them in the background.
+              </Text>
+            </div>
           </div>
         </div>
       </div>

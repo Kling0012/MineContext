@@ -1,5 +1,6 @@
 import { getLogger } from '@shared/logger/renderer'
 import { omit } from 'lodash'
+import { defaultGeneralSettings } from './setting'
 
 const logger = getLogger('migrations')
 
@@ -20,6 +21,25 @@ const migrations = {
       logger.info('Migration v2: "chatHistory" not found in state, nothing to remove.')
     }
 
+    return newState
+  },
+  3: (state: any): any => {
+    logger.info('Running redux-persist migration for version 3...')
+
+    if (!state) {
+      logger.warn('Migration v3: Received undefined state, returning state as-is.')
+      return state
+    }
+
+    const newState = {
+      ...state,
+      setting: {
+        ...state.setting,
+        generalSettings: { ...defaultGeneralSettings, ...state.setting?.generalSettings }
+      }
+    }
+
+    logger.info('Migration v3: Ensured "setting.generalSettings" defaults (auto update check off).')
     return newState
   }
 }

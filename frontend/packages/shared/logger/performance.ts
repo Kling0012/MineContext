@@ -7,7 +7,7 @@ import fs from 'fs'
 import inspector from 'inspector'
 import pidusage from 'pidusage'
 import v8 from 'v8'
-import { PerformanceObserver, monitorEventLoopDelay, IntervalHistogram } from 'perf_hooks'
+import { PerformanceObserver, monitorEventLoopDelay } from 'perf_hooks'
 import { is } from '@electron-toolkit/utils'
 import Logger from 'electron-log/main'
 import dayjs from 'dayjs'
@@ -136,7 +136,7 @@ class PerformanceMonitor {
   }
   private baseline = { cpu: 0, memory: 0 }
   private monitoringInterval: NodeJS.Timeout | null = null
-  private eventLoopHistogram: IntervalHistogram | null = null
+  private eventLoopHistogram: ReturnType<typeof monitorEventLoopDelay> | null = null
 
   constructor() {
     this.profiler = new CPUProfiler(

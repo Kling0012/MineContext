@@ -54,7 +54,7 @@ linux:
     - AppImage
     - snap
     - deb
-  maintainer: electronjs.org
+  maintainer: Kling0012
   category: Utility
 appImage:
   artifactName: ${name}-${version}.${ext}
@@ -64,7 +64,5 @@ buildDependenciesFromSource: false
 afterSign: build/notarize.js
 publish:
   provider: github
-  owner: volcengine
+  owner: Kling0012
   repo: MineContext
-electronDownload:
-  mirror: https://npmmirror.com/mirrors/electron/

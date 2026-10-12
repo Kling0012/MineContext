@@ -4,13 +4,17 @@
 import { useCallback } from 'react'
 import { useSelector } from 'react-redux'
 import { RootState, useAppDispatch } from '@renderer/store'
-import { ApplyToDays, setScreenSettings as setScreenSettingsAction } from '@renderer/store/setting'
+import { ApplyToDays, GeneralSettings, setScreenSettings as setScreenSettingsAction, setGeneralSettings as setGeneralSettingsAction } from '@renderer/store/setting'
 
 export const useSetting = () => {
   const dispatch = useAppDispatch()
   const screenSettings = useSelector((state: RootState) => state.setting.screenSettings)
 
   const { recordInterval, recordingHours, enableRecordingHours, applyToDays } = screenSettings
+
+  const autoCheckUpdate = useSelector(
+    (state: RootState) => state.setting?.generalSettings?.autoCheckUpdate ?? false
+  )
 
   const setRecordInterval = useCallback(
     (interval: number) => {
@@ -40,14 +44,23 @@ export const useSetting = () => {
     [dispatch]
   )
 
+  const setGeneralSettings = useCallback(
+    (settings: Partial<GeneralSettings>) => {
+      dispatch(setGeneralSettingsAction(settings))
+    },
+    [dispatch]
+  )
+
   return {
     recordInterval,
     recordingHours,
     enableRecordingHours,
     applyToDays,
+    autoCheckUpdate,
     setRecordInterval,
     setEnableRecordingHours,
     setRecordingHours,
-    setApplyToDays
+    setApplyToDays,
+    setGeneralSettings
   }
 }

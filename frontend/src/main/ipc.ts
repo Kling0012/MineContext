@@ -125,7 +125,7 @@ export function registerIpc(mainWindow: BrowserWindow, app: Electron.App) {
         sessions.map(async (session) => {
           await session.clearCache()
           await session.clearStorageData({
-            storages: ['cookies', 'filesystem', 'shadercache', 'websql', 'serviceworkers', 'cachestorage']
+            storages: ['cookies', 'filesystem', 'shadercache', 'serviceworkers', 'cachestorage']
           })
         })
       )

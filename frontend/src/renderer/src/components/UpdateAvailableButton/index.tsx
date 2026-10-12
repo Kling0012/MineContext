@@ -3,18 +3,23 @@ import rocketSvg from '@renderer/assets/icons/rocket.svg'
 import { UpdateInfo } from 'electron-updater'
 import { IpcChannel } from '@shared/IpcChannel'
 import { debounce } from 'lodash'
+import { useSetting } from '@renderer/hooks/use-setting'
 
 export default function UpdateAvailableButton() {
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
   const [isDownloaded, setIsDownloaded] = useState(false)
   const [isHovered, setIsHovered] = useState(false)
+  const { autoCheckUpdate } = useSetting()
   useEffect(() => {
+    // Auto update check is opt-in (off by default). Without the setting we never
+    // contact GitHub releases on startup.
+    if (!autoCheckUpdate) return
     ;(async () => {
       const { updateInfo: _updateInfo } = await window.api.checkForUpdate()
       console.log("checkForUpdate", _updateInfo)
       setUpdateInfo(_updateInfo)
     })()
-  }, [])
+  }, [autoCheckUpdate])
 
   useEffect(() => {
     if (!window.electron) return
