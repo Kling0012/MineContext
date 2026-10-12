@@ -32,9 +32,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== 1. compose up (EMBED_PROVIDER=fake)"
+echo "=== 1. compose up (EMBED_PROVIDER=fake, LLM_PROVIDER=fake, short judge/idle)"
 $DC down -v >/dev/null 2>&1
-if ! sudo env EMBED_PROVIDER=fake $DC up -d --build >/dev/null 2>&1; then
+# NOTE: env must reach `docker compose` directly (a nested sudo would env-reset it).
+if ! sudo env EMBED_PROVIDER=fake LLM_PROVIDER=fake SESSION_JUDGE_INTERVAL=3 IDLE_MINUTES=0.2 docker compose up -d --build >/dev/null 2>&1; then
   bad "docker compose up"
   echo "results: PASS=$PASS FAIL=$FAIL"; exit 1
 fi
@@ -127,8 +128,103 @@ check "$CODE" "404" "second delete -> 404"
 N=$(req GET "/v1/events?device_id=mac-1&limit=10" | jq '[.events[].id] | index("'$E3'") != null')
 check "$N" "false" "deleted event gone from list"
 
-echo "=== 10. embedding failure (openai_compat unreachable): ingest+search keep working"
-sudo env EMBED_PROVIDER=openai_compat EMBED_BASE_URL=http://10.255.255.1:1/v1 EMBED_MODEL=test $DC up -d api >/dev/null 2>&1 || bad "recreate api with openai_compat"
+echo "=== 10. work sessions: declare -> related events auto-link"
+S1=$(req POST /v1/sessions '{"title":"財務レポート","note":"Q3の数値確認","device_id":"mac-1"}')
+SID1=$(echo "$S1" | jq -r .session.id)
+check "$(echo "$S1" | jq -r .session.status)" "active" "declare session -> active"
+check "$(echo "$S1" | jq -r .session.superseded)" "null" "first declare supersedes nothing"
+R1=$(uuid); R2=$(uuid); R3=$(uuid)
+RT1=$(date -u -d '+1 seconds' +%Y-%m-%dT%H:%M:%SZ)
+RT2=$(date -u -d '+2 seconds' +%Y-%m-%dT%H:%M:%SZ)
+RT3=$(date -u -d '+3 seconds' +%Y-%m-%dT%H:%M:%SZ)
+RB="{\"device_id\":\"mac-1\",\"events\":[$(mk $R1 mac-1 activity "$RT1" '財務レポートの数値を確認している' 'finance'),$(mk $R2 mac-1 activity "$RT2" '財務レポートのグラフを作った' 'chart'),$(mk $R3 mac-1 screen_summary "$RT3" '画面:財務レポートのスプレッドシート' 'screen')]}"
+R=$(req POST "/v1/events:batch" "$RB")
+check "$(echo "$R" | jq -r .accepted)" "3" "related events ingested"
+LNK=$(req GET "/v1/events?device_id=mac-1&limit=10" | jq -r ".events[] | select(.id==\"$R3\") | .session_id")
+check "$LNK" "$SID1" "activity/screen_summary auto-linked to active session"
+sleep 5
+A=$(req GET /v1/sessions/active | jq -r .session.id)
+check "$A" "$SID1" "session stays active while related events continue"
+
+echo "=== 11. unrelated events -> ai_detected end at last related event"
+U1=$(uuid); U2=$(uuid); U3=$(uuid)
+UT1=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+UT2=$(date -u -d '+1 seconds' +%Y-%m-%dT%H:%M:%SZ)
+UT3=$(date -u -d '+2 seconds' +%Y-%m-%dT%H:%M:%SZ)
+UB="{\"device_id\":\"mac-1\",\"events\":[$(mk $U1 mac-1 activity "$UT1" '家族の旅行の写真を見ている' 'photos'),$(mk $U2 mac-1 activity "$UT2" '音楽を聴きながらWebを見る' 'browse'),$(mk $U3 mac-1 screen_summary "$UT3" '画面:動画サイト' 'video')]}"
+R=$(req POST "/v1/events:batch" "$UB")
+check "$(echo "$R" | jq -r .accepted)" "3" "unrelated events ingested"
+ST=""
+for i in $(seq 1 20); do
+  ST=$(req GET "/v1/sessions/$SID1" | jq -r .status)
+  [ "$ST" = "ended" ] && break
+  sleep 1
+done
+check "$ST" "ended" "session ended after unrelated events (ai_detected)"
+S=$(req GET "/v1/sessions/$SID1")
+check "$(echo "$S" | jq -r .end_reason)" "ai_detected" "end_reason=ai_detected"
+check "$(echo "$S" | jq -r .confirmed)" "false" "ai end leaves confirmed=false"
+check "$(echo "$S" | jq -r '.end_evidence[0].event_id')" "$R3" "evidence points at last related event"
+ET=$(req GET "/v1/events?device_id=mac-1&limit=50" | jq -r ".events[] | select(.id==\"$R3\") | .started_at")
+check "$(echo "$S" | jq -r .ended_at)" "$ET" "ended_at = last related event time (not judge time)"
+
+echo "=== 12. supersede / idle end / PATCH / cancel"
+S2=$(req POST /v1/sessions '{"title":"メール処理","device_id":"win-1"}')
+SID2=$(echo "$S2" | jq -r .session.id)
+S3=$(req POST /v1/sessions '{"title":"資料読み","device_id":"mac-1"}')
+SID3=$(echo "$S3" | jq -r .session.id)
+check "$(echo "$S3" | jq -r .superseded.id)" "$SID2" "new declare returns superseded session"
+S2R=$(req GET "/v1/sessions/$SID2")
+check "$(echo "$S2R" | jq -r .status)" "ended" "old active session superseded -> ended"
+check "$(echo "$S2R" | jq -r .end_reason)" "superseded" "end_reason=superseded"
+check "$(echo "$S2R" | jq -r .ended_at)" "$(echo "$S3" | jq -r .session.started_at)" "superseded ended_at = new started_at"
+A=$(req GET /v1/sessions/active | jq -r .session.id)
+check "$A" "$SID3" "newest declaration is the active session"
+RL=$(uuid); RLT=$(date -u -d '+1 seconds' +%Y-%m-%dT%H:%M:%SZ)
+R=$(req POST "/v1/events:batch" "{\"device_id\":\"mac-1\",\"events\":[$(mk $RL mac-1 activity "$RLT" '資料読み:設計書の章を読み進めた' 'reading')]}")
+LNK=$(req GET "/v1/events?device_id=mac-1&kind=activity&limit=50" | jq -r ".events[] | select(.id==\"$RL\") | .session_id")
+check "$LNK" "$SID3" "event links to the new active session"
+ST=""
+for i in $(seq 1 40); do
+  ST=$(req GET "/v1/sessions/$SID3" | jq -r .status)
+  [ "$ST" = "ended" ] && break
+  sleep 1
+done
+check "$ST" "ended" "session idle-ended after events stop"
+S=$(req GET "/v1/sessions/$SID3")
+check "$(echo "$S" | jq -r .end_reason)" "idle" "end_reason=idle"
+check "$(echo "$S" | jq -r '.end_evidence[0].event_id')" "$RL" "idle evidence = last event"
+RLET=$(req GET "/v1/events?device_id=mac-1&kind=activity&limit=50" | jq -r ".events[] | select(.id==\"$RL\") | .started_at")
+check "$(echo "$S" | jq -r .ended_at)" "$RLET" "idle ended_at = last event time"
+NEWEND=$(date -u -d "@$(( $(date -u -d "$RLT" +%s) + 300 ))" +%Y-%m-%dT%H:%M:%SZ)
+P=$(req PATCH "/v1/sessions/$SID3" "{\"title\":\"資料読み(修正済み)\",\"ended_at\":\"$NEWEND\",\"confirmed\":true}")
+check "$(echo "$P" | jq -r .title)" "資料読み(修正済み)" "PATCH updates title"
+check "$(echo "$P" | jq -r .confirmed)" "true" "PATCH confirms session"
+check "$(date -u -d "$(echo "$P" | jq -r .ended_at)" +%s)" "$(date -u -d "$NEWEND" +%s)" "PATCH sets ended_at"
+S4=$(req POST /v1/sessions '{"title":"中止する宣言"}')
+SID4=$(echo "$S4" | jq -r .session.id)
+C=$(req POST "/v1/sessions/$SID4/cancel")
+check "$(echo "$C" | jq -r .status)" "cancelled" "cancel -> cancelled"
+A=$(req GET /v1/sessions/active | jq -r .session)
+check "$A" "null" "no active session remains"
+
+echo "=== 13. timeline: sessions + events + ai_work chronological, per-session totals"
+AW=$(uuid); AWT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+R=$(req POST "/v1/events:batch" "{\"device_id\":\"win-1\",\"events\":[{\"id\":\"$AW\",\"kind\":\"ai_work\",\"started_at\":\"$AWT\",\"text\":\"Claude が P2B セッション機能を実装した\",\"title\":\"P2B 実装\",\"source\":\"claude\",\"meta\":{\"agent\":\"claude\"}}]}")
+check "$(echo "$R" | jq -r .accepted)" "1" "ai_work event ingested"
+TL=$(req GET "/v1/timeline?date=${DAY}&tz=Asia/Tokyo")
+# compare at second precision: t may mix micro (sessions) and second (events) forms
+check "$(echo "$TL" | jq -r '[.items[].t | sub("\\.[0-9]+";"")] == ([.items[].t | sub("\\.[0-9]+";"")]|sort)')" "true" "timeline items are chronological"
+check "$(echo "$TL" | jq -r '[.items[] | select(.type=="session") | .session.id] | index("'$SID1'") != null')" "true" "timeline includes sessions"
+check "$(echo "$TL" | jq -r '.items[] | select(.type=="ai_work") | .event.source')" "claude" "ai_work item carries source"
+check "$(echo "$TL" | jq -r '.items[] | select(.type=="ai_work") | .event.device_name')" "Windowsデスクトップ" "timeline events carry device name"
+check "$(echo "$TL" | jq -r '.session_totals[] | select(.session_id=="'$SID3'") | .minutes > 4')" "true" "per-session total minutes (s3 ~5min)"
+check "$(echo "$TL" | jq -r '.total_minutes > 0')" "true" "total_minutes present"
+
+echo "=== 14. embedder + LLM unreachable: ingest, sessions and search keep working"
+sudo env EMBED_PROVIDER=openai_compat EMBED_BASE_URL=http://10.255.255.1:1/v1 EMBED_MODEL=test \
+  LLM_PROVIDER=openai_compat LLM_BASE_URL=http://10.255.255.1:1/v1 LLM_TIMEOUT_SEC=5 SESSION_JUDGE_INTERVAL=5 \
+  docker compose up -d api >/dev/null 2>&1 || bad "recreate api with unreachable providers"
 HZ=""
 for i in $(seq 1 60); do
   HZ=$(curl -s "$BASE/healthz" || true)
@@ -144,6 +240,28 @@ H=$(echo "$S" | jq -r '[.hits[].event.id] | index("'$E5'")')
 [ "$H" != "null" ] && ok "search (trgm) works while embedder fails" || bad "search during embed failure: $S"
 P=$(curl -s "$BASE/healthz" | jq .embed_pending)
 if [ "$P" -ge 1 ] 2>/dev/null; then ok "embed_pending grows ($P) but service stays up"; else bad "embed_pending=$P"; fi
+S5=$(req POST /v1/sessions '{"title":"障害時の作業"}')
+SID5=$(echo "$S5" | jq -r .session.id)
+check "$(echo "$S5" | jq -r .session.status)" "active" "declare works while LLM unreachable"
+# an event is needed so the judge reaches the LLM call (no-event sessions idle
+# out before the LLM is consulted); +1s keeps it after the session's start
+E6=$(uuid); E6T=$(date -u -d '+1 seconds' +%Y-%m-%dT%H:%M:%SZ)
+R=$(req POST "/v1/events:batch" "{\"device_id\":\"win-1\",\"events\":[{\"id\":\"$E6\",\"kind\":\"activity\",\"started_at\":\"$E6T\",\"text\":\"障害時でも活動を記録する\",\"title\":\"resilient activity\"}]}")
+check "$(echo "$R" | jq -r .accepted)" "1" "ingest works while LLM unreachable"
+sleep 8
+check "$(curl -s "$BASE/healthz" | jq -r .ok)" "true" "healthz still ok with failing judge"
+A=$(req GET /v1/sessions/active | jq -r .session.id)
+check "$A" "$SID5" "session stays active when judge fails (fail-soft)"
+JLOG=""
+for i in $(seq 1 25); do
+  if $DC logs api 2>&1 | grep -q "session judge failed"; then JLOG=1; break; fi
+  sleep 1
+done
+if [ -n "$JLOG" ]; then
+  ok "judge failure logged (skips cycle only, server keeps running)"
+else
+  bad "no judge failure log found"
+fi
 
 echo
 echo "results: PASS=$PASS FAIL=$FAIL"

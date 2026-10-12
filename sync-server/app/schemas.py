@@ -48,6 +48,7 @@ class EventOut(BaseModel):
     text: str
     meta: dict
     source: str | None
+    session_id: uuid.UUID | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -98,3 +99,81 @@ class HealthResponse(BaseModel):
     ok: bool
     db: str
     embed_pending: int
+
+
+class SessionCreateIn(BaseModel):
+    title: str = Field(min_length=1)
+    note: str | None = None
+    device_id: str | None = None
+    started_at: datetime | None = None  # default: now
+
+
+class SessionEndIn(BaseModel):
+    ended_at: datetime | None = None  # default: now
+
+
+class SessionPatchIn(BaseModel):
+    title: str | None = Field(default=None, min_length=1)
+    note: str | None = None
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    confirmed: bool | None = None
+
+
+class SessionOut(BaseModel):
+    id: uuid.UUID
+    device_id: str | None
+    title: str
+    note: str | None
+    started_at: datetime
+    ended_at: datetime | None
+    status: str
+    end_reason: str | None
+    end_confidence: float | None
+    end_evidence: list[dict]
+    confirmed: bool
+    duration_minutes: float = 0.0
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class SessionCreateOut(BaseModel):
+    session: SessionOut
+    superseded: SessionOut | None = None
+
+
+class SessionsPage(BaseModel):
+    sessions: list[SessionOut]
+
+
+class ActiveSessionOut(BaseModel):
+    session: SessionOut | None = None
+
+
+class SessionTotal(BaseModel):
+    session_id: uuid.UUID
+    title: str
+    status: str
+    confirmed: bool
+    started_at: datetime
+    ended_at: datetime | None
+    minutes: float
+
+
+class TimelineItem(BaseModel):
+    type: str  # "session" | "event" | "ai_work"
+    t: datetime
+    event: EventOut | None = None
+    session: SessionOut | None = None
+
+
+class TimelineResponse(BaseModel):
+    date: str
+    tz: str
+    from_at: datetime
+    to_at: datetime
+    items: list[TimelineItem]
+    session_totals: list[SessionTotal]
+    total_minutes: float

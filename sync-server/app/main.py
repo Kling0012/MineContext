@@ -11,27 +11,46 @@ from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
-from sqlalchemy import func, select, text as sql_text, tuple_
+from sqlalchemy import func, or_, select, text as sql_text, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from . import config
 from .db import engine, get_db
 from .embedding import embed_sync, embedding_worker, pending_count
-from .models import Device, Event, EVENT_KINDS
+from .models import (
+    AUTO_LINK_KINDS,
+    Device,
+    Event,
+    EVENT_KINDS,
+    SESSION_STATUSES,
+    WorkSession,
+)
 from .schemas import (
+    ActiveSessionOut,
     BatchResult,
     DayCounts,
     DayResponse,
     DeviceIn,
     EventBatchIn,
+    EventIn,
     EventOut,
     EventsPage,
     HealthResponse,
     SearchHit,
     SearchIn,
     SearchResponse,
+    SessionCreateIn,
+    SessionCreateOut,
+    SessionEndIn,
+    SessionOut,
+    SessionPatchIn,
+    SessionTotal,
+    SessionsPage,
+    TimelineItem,
+    TimelineResponse,
 )
+from .session_judge import session_judge_worker
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("sync.api")
@@ -39,11 +58,16 @@ log = logging.getLogger("sync.api")
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(embedding_worker())
+    tasks = [
+        asyncio.create_task(embedding_worker()),
+        asyncio.create_task(session_judge_worker()),
+    ]
     yield
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    for task in tasks:
+        task.cancel()
+    for task in tasks:
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 app = FastAPI(title="MineContext sync-server", lifespan=lifespan)
@@ -84,9 +108,49 @@ def put_device(device_id: str, body: DeviceIn, db: Session = Depends(get_db)):
     return jsonable_encoder(device)
 
 
+def _as_utc(dt: datetime) -> datetime:
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _session_links(db: Session, events: list[EventIn]) -> dict[uuid.UUID, uuid.UUID]:
+    """Map activity/screen_summary event id -> the session active at its time.
+
+    "Active at time T" = not cancelled, started_at <= T < ended_at (or no end).
+    The latest such session wins (normally at most one by construction).
+    """
+    times = [
+        _as_utc(ev.started_at)
+        for ev in events
+        if ev.kind in AUTO_LINK_KINDS
+    ]
+    if not times:
+        return {}
+    lo, hi = min(times), max(times)
+    cands = db.scalars(
+        select(WorkSession)
+        .where(
+            WorkSession.status != "cancelled",
+            WorkSession.started_at <= hi,
+            or_(WorkSession.ended_at.is_(None), WorkSession.ended_at > lo),
+        )
+        .order_by(WorkSession.started_at.desc())
+    ).fetchall()
+    links: dict[uuid.UUID, uuid.UUID] = {}
+    for ev in events:
+        if ev.kind not in AUTO_LINK_KINDS:
+            continue
+        t = _as_utc(ev.started_at)
+        for c in cands:  # desc order: first match = latest start <= t
+            if c.started_at <= t and (c.ended_at is None or t < c.ended_at):
+                links[ev.id] = c.id
+                break
+    return links
+
+
 @app.post("/v1/events:batch", response_model=BatchResult)
 def post_events_batch(body: EventBatchIn, db: Session = Depends(get_db)):
     _ensure_device(db, body.device_id)
+    links = _session_links(db, body.events)
     incoming = {ev.id: ev for ev in body.events}
     existing = set(
         db.scalars(select(Event.id).where(Event.id.in_(incoming.keys()))).fetchall()
@@ -103,6 +167,7 @@ def post_events_batch(body: EventBatchIn, db: Session = Depends(get_db)):
             text=ev.text,
             meta=ev.meta,
             source=ev.source,
+            session_id=links.get(ev.id),
         )
         stmt = stmt.on_conflict_do_update(
             index_elements=["id"],
@@ -116,6 +181,7 @@ def post_events_batch(body: EventBatchIn, db: Session = Depends(get_db)):
                 "text": ev.text,
                 "meta": ev.meta,
                 "source": ev.source,
+                "session_id": links.get(ev.id),
                 "updated_at": func.now(),
             },
         )
@@ -324,3 +390,224 @@ def delete_event(event_id: uuid.UUID, db: Session = Depends(get_db)):
     db.delete(ev)
     db.commit()
     return {"deleted": str(event_id)}
+
+
+# --- Work sessions (P2-B): declare -> AI-judged end -> timeline ---
+
+
+def _duration_minutes(s: WorkSession, now: datetime | None = None) -> float:
+    end = s.ended_at or (now or datetime.now(timezone.utc))
+    return max(0.0, (end - s.started_at).total_seconds() / 60.0)
+
+
+def _session_out(s: WorkSession, now: datetime | None = None) -> SessionOut:
+    out = SessionOut.model_validate(s)
+    out.duration_minutes = round(_duration_minutes(s, now), 2)
+    return out
+
+
+def _get_session(db: Session, session_id: uuid.UUID) -> WorkSession:
+    s = db.get(WorkSession, session_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return s
+
+
+@app.post("/v1/sessions", response_model=SessionCreateOut)
+def create_session(body: SessionCreateIn, db: Session = Depends(get_db)):
+    started = _as_utc(body.started_at or datetime.now(timezone.utc))
+    superseded: WorkSession | None = None
+    for old in db.scalars(
+        select(WorkSession).where(WorkSession.status == "active")
+    ).fetchall():
+        old.status = "ended"
+        old.end_reason = "superseded"
+        old.ended_at = max(old.started_at, started)  # clamp for backdated declares
+        superseded = old
+    s = WorkSession(
+        title=body.title,
+        note=body.note,
+        device_id=body.device_id,
+        started_at=started,
+    )
+    db.add(s)
+    db.commit()
+    return SessionCreateOut(
+        session=_session_out(s),
+        superseded=_session_out(superseded) if superseded else None,
+    )
+
+
+@app.get("/v1/sessions/active", response_model=ActiveSessionOut)
+def get_active_session(db: Session = Depends(get_db)):
+    s = db.scalars(
+        select(WorkSession)
+        .where(WorkSession.status == "active")
+        .order_by(WorkSession.started_at.desc())
+        .limit(1)
+    ).first()
+    return ActiveSessionOut(session=_session_out(s) if s else None)
+
+
+@app.get("/v1/sessions/{session_id}", response_model=SessionOut)
+def get_session(session_id: uuid.UUID, db: Session = Depends(get_db)):
+    return _session_out(_get_session(db, session_id))
+
+
+@app.get("/v1/sessions", response_model=SessionsPage)
+def list_sessions(
+    from_: datetime | None = Query(default=None, alias="from"),
+    to: datetime | None = Query(default=None),
+    status: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    if status is not None and status not in SESSION_STATUSES:
+        raise HTTPException(status_code=422, detail=f"unknown status: {status}")
+    q = select(WorkSession).order_by(WorkSession.started_at.asc(), WorkSession.id.asc())
+    if from_ is not None:
+        q = q.where(WorkSession.started_at >= from_)
+    if to is not None:
+        q = q.where(WorkSession.started_at < to)
+    if status is not None:
+        q = q.where(WorkSession.status == status)
+    q = q.limit(limit)
+    now = datetime.now(timezone.utc)
+    sessions = [_session_out(s, now) for s in db.scalars(q).fetchall()]
+    return SessionsPage(sessions=sessions)
+
+
+@app.post("/v1/sessions/{session_id}/end", response_model=SessionOut)
+def end_session(session_id: uuid.UUID, body: SessionEndIn, db: Session = Depends(get_db)):
+    s = _get_session(db, session_id)
+    if s.status == "cancelled":
+        raise HTTPException(status_code=409, detail="session is cancelled")
+    ended = _as_utc(body.ended_at or datetime.now(timezone.utc))
+    if ended < s.started_at:
+        raise HTTPException(status_code=422, detail="ended_at before started_at")
+    s.status = "ended"
+    s.ended_at = ended
+    s.end_reason = "manual"
+    s.confirmed = True
+    db.commit()
+    return _session_out(s)
+
+
+@app.patch("/v1/sessions/{session_id}", response_model=SessionOut)
+def patch_session(
+    session_id: uuid.UUID, body: SessionPatchIn, db: Session = Depends(get_db)
+):
+    s = _get_session(db, session_id)
+    data = body.model_dump(exclude_unset=True)
+    if "started_at" in data and data["started_at"] is not None:
+        data["started_at"] = _as_utc(data["started_at"])
+    if "ended_at" in data and data["ended_at"] is not None:
+        data["ended_at"] = _as_utc(data["ended_at"])
+    new_started = data.get("started_at", s.started_at)
+    new_ended = data.get("ended_at", s.ended_at)
+    if new_ended is not None and new_ended < new_started:
+        raise HTTPException(status_code=422, detail="ended_at before started_at")
+    for field in ("title", "note", "started_at", "ended_at", "confirmed"):
+        if field in data:
+            setattr(s, field, data[field])
+    if "ended_at" in data:
+        if data["ended_at"] is None:
+            if s.status == "ended":  # clearing the end reopens the session
+                s.status = "active"
+                s.end_reason = None
+                s.end_confidence = None
+        elif s.status == "active":
+            s.status = "ended"
+            if s.end_reason is None:
+                s.end_reason = "manual"
+    db.commit()
+    return _session_out(s)
+
+
+@app.post("/v1/sessions/{session_id}/cancel", response_model=SessionOut)
+def cancel_session(session_id: uuid.UUID, db: Session = Depends(get_db)):
+    s = _get_session(db, session_id)
+    if s.status != "cancelled":
+        s.status = "cancelled"
+    db.commit()
+    return _session_out(s)
+
+
+@app.get("/v1/timeline", response_model=TimelineResponse)
+def get_timeline(
+    date_: date = Query(alias="date"),
+    tz: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    tz_name = tz or config.TZ_DEFAULT
+    try:
+        zone = ZoneInfo(tz_name)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"unknown tz: {tz_name}") from e
+    start_local = datetime.combine(date_, time.min, tzinfo=zone)
+    end_local = datetime.combine(date_, time.max, tzinfo=zone).replace(
+        microsecond=999999
+    )
+    window_start = start_local.astimezone(timezone.utc)
+    window_end = end_local.astimezone(timezone.utc)
+    now = datetime.now(timezone.utc)
+
+    sessions = db.scalars(
+        select(WorkSession)
+        .where(
+            WorkSession.started_at <= window_end,
+            or_(WorkSession.ended_at.is_(None), WorkSession.ended_at >= window_start),
+        )
+        .order_by(WorkSession.started_at.asc(), WorkSession.id.asc())
+    ).fetchall()
+    rows = db.execute(
+        select(Event, Device.name)
+        .join(Device, Event.device_id == Device.id, isouter=True)
+        .where(Event.started_at >= window_start, Event.started_at <= window_end)
+        .order_by(Event.started_at.asc(), Event.id.asc())
+    ).fetchall()
+
+    items: list[TimelineItem] = []
+    for s in sessions:
+        items.append(
+            TimelineItem(type="session", t=s.started_at, session=_session_out(s, now))
+        )
+    for ev, device_name in rows:
+        out = EventOut.model_validate(ev)
+        out.device_name = device_name
+        items.append(
+            TimelineItem(
+                type="ai_work" if ev.kind == "ai_work" else "event",
+                t=ev.started_at,
+                event=out,
+            )
+        )
+    items.sort(
+        key=lambda it: (
+            it.t,
+            0 if it.type == "session" else 1,
+            str((it.session or it.event).id),
+        )
+    )
+    totals = [
+        SessionTotal(
+            session_id=s.id,
+            title=s.title,
+            status=s.status,
+            confirmed=s.confirmed,
+            started_at=s.started_at,
+            ended_at=s.ended_at,
+            minutes=round(_duration_minutes(s, now), 2),
+        )
+        for s in sessions
+        if s.status != "cancelled"
+    ]
+    return TimelineResponse(
+        date=date_.isoformat(),
+        tz=tz_name,
+        from_at=window_start,
+        to_at=window_end,
+        items=items,
+        session_totals=totals,
+        total_minutes=round(sum(t.minutes for t in totals), 2),
+    )

@@ -32,7 +32,15 @@ curl -s http://127.0.0.1:18741/healthz
 | `EMBED_DIM` | `1024` | 埋め込み次元。**マイグレーション時に vector 列の次元として固定される** |
 | `EMBED_API_KEY_FILE` | 空 | API キーのファイルパス（秘密はファイル参照のみ） |
 | `EMBED_INTERVAL_SEC` | `5` | バックグラウンド埋め込みの周期 |
-| `TZ_DEFAULT` | `Asia/Tokyo` | `GET /v1/days/{date}` の tz 既定値 |
+| `TZ_DEFAULT` | `Asia/Tokyo` | `GET /v1/days/{date}` と `GET /v1/timeline` の tz 既定値 |
+| `LLM_PROVIDER` | `openai_compat` | 作業終了判定の LLM。`openai_compat`（`/chat/completions`）または `fake`（開発用・決定的・外部通信なし） |
+| `LLM_BASE_URL` | 空 | OpenAI 互換のベース URL（`.../v1` まで）。`openai_compat` 時必須（未設定なら判定をスキップしてログのみ） |
+| `LLM_MODEL` | `glm-5.3-flash` | 終了判定に使うモデル名 |
+| `LLM_API_KEY_FILE` | 空 | API キーのファイルパス（秘密はファイル参照のみ） |
+| `LLM_TIMEOUT_SEC` | `30` | LLM 通信のタイムアウト秒 |
+| `SESSION_JUDGE_INTERVAL` | `120` | 終了判定の周期（秒） |
+| `SESSION_END_THRESHOLD` | `0.75` | LLM 判定で終了扱いにする確信度のしきい値 |
+| `IDLE_MINUTES` | `15` | 全端末でイベントが無い状態がこの分数続くと idle 終了 |
 
 注意: `EMBED_DIM` を変えると既存 DB の vector 列と不一致になるため、
 新規ボリューム（`docker compose down -v`）で初期化すること。
@@ -46,6 +54,21 @@ curl -s http://127.0.0.1:18741/healthz
 - `event_embeddings(event_id PK FK CASCADE, model, embedding vector(EMBED_DIM), embedded_at)`
   - 埋め込みキューは持たず、「event_embeddings に無い events」を未処理とみなしてバックグラウンドで埋め込み。
     失敗しても events の保存・検索は止まらない（fail-soft。次の周期で再試行）。
+- `work_sessions(id uuid PK, device_id（宣言した端末）, title, note, started_at, ended_at, status active/ended/cancelled, end_reason manual/ai_detected/idle/superseded, end_confidence, end_evidence jsonb（根拠にした event id と理由）, confirmed, created_at, updated_at)`
+  - 「これから○○をする」の宣言。同時に active は1件だけで、新しい宣言は旧 active を
+    `superseded` で終了させる（終了時刻 = 新しい宣言の開始時刻）。
+  - 終了判定はバックグラウンド（`SESSION_JUDGE_INTERVAL` 秒ごと）。全端末の
+    activity/screen_summary を最大30件集め、(1) `IDLE_MINUTES` 分どの端末からも
+    イベントが無ければ `idle` 終了、(2) それ以外は LLM が JSON
+    `{ongoing, ended_at_event_id, confidence, reason}` で判定し
+    `ongoing=false` かつ `confidence >= SESSION_END_THRESHOLD` なら `ai_detected` 終了。
+    終了時刻は「作業に関係した最後のイベント」の時刻。判定結果は `confirmed=false` のまま
+    で、後から PATCH で修正・確定できる。LLM 失敗・設定なしはその回の判定スキップのみ
+    （fail-soft。サーバ全体は止まらない）。`LLM_PROVIDER=fake` は title の単語が
+    直近の記録から消えたら終了とみなす決定的ロジック（開始後3件未満は継続扱い）。
+- `events.session_id uuid null`（FK, ON DELETE SET NULL）
+  - `events:batch` で受けた activity/screen_summary は、その時刻に active な
+    work_session があれば自動で紐づける。
 
 ## API 例（curl）
 
@@ -96,6 +119,34 @@ curl -s -X POST $B/v1/search -H 'Content-Type: application/json' -d '{
 
 # 削除（単体のみ）
 curl -s -X DELETE $B/v1/events/0192a0c0-0000-7000-8000-000000000001
+
+# 作業宣言（新しい宣言は旧 active を superseded 終了させる）
+curl -s -X POST $B/v1/sessions -H 'Content-Type: application/json' -d '{
+  "title":"財務レポート", "note":"Q3のレビュー", "device_id":"mac-1"
+}'
+# -> {"session":{"id":"...","status":"active",...},"superseded":null}
+
+# 現在の active な宣言
+curl -s $B/v1/sessions/active
+
+# 手動終了（manual・confirmed=true）
+curl -s -X POST $B/v1/sessions/<id>/end -H 'Content-Type: application/json' \
+  -d '{"ended_at":"2026-10-12T11:30:00+09:00"}'
+
+# 修正・確定（title/note/started_at/ended_at/confirmed。AI 終了の確定に使う）
+curl -s -X PATCH $B/v1/sessions/<id> -H 'Content-Type: application/json' \
+  -d '{"title":"財務レポート（訂正）","ended_at":"2026-10-12T11:15:00+09:00","confirmed":true}'
+
+# 取り消し（宣言を撤回）
+curl -s -X POST $B/v1/sessions/<id>/cancel
+
+# 一覧
+curl -s "$B/v1/sessions?from=2026-10-12T00:00:00Z&status=ended"
+
+# 1日分の統合タイムライン: sessions + events（端末名付き）+ ai_work を時刻順1本、
+# セッション別の合計時間（cancelled を除く）付き
+curl -s "$B/v1/timeline?date=2026-10-12&tz=Asia/Tokyo" | \
+  jq '{total_minutes, totals: [.session_totals[]|{title,minutes,status}], items: [.items[]|{type,t,title:(.session.title // .event.title)}]}'
 ```
 
 ## E2E テスト
@@ -104,10 +155,15 @@ curl -s -X DELETE $B/v1/events/0192a0c0-0000-7000-8000-000000000001
 sudo ./scripts/e2e.sh
 ```
 
-docker compose up（fake）→ healthz → 端末2台登録 → 2台分イベント投入（ja/en、
-同 id 再投入で更新）→ days で時系列・件数 → カーソルページング → 検索（日本語部分一致と
-ベクトル側一致）→ 削除 → 埋め込み失敗時の投入・検索継続、を curl+jq で検証し
-PASS/FAIL を出す。終了時に `compose down -v` で環境を消す。
+docker compose up（fake 埋め込み + fake 終了判定、判定周期3秒・idle 12秒）→ healthz →
+端末2台登録 → 2台分イベント投入（ja/en、同 id 再投入で更新）→ days で時系列・件数 →
+カーソルページング → 検索（日本語部分一致とベクトル側一致）→ 削除 → 作業宣言と
+activity/screen_summary の自動紐付け → 無関係なイベントが続くと ai_detected 終了
+（終了時刻は最後の関係イベント時刻）→ 新しい宣言で旧 active が superseded →
+イベント途絶えで idle 終了 → PATCH で修正と confirmed → cancel → timeline で
+sessions・events・ai_work が時刻順に並びセッション別合計が出る → 埋め込みと LLM
+到達不能時の投入・検索・宣言の継続、を curl+jq で検証し PASS/FAIL を出す。
+終了時に `compose down -v` で環境を消す。
 
 `fake` provider はテキストの単語・文字2-gram を特徴ハッシュした決定的ベクトルで、
 「意味検索」は n-gram 共有による近似（外部通信なし）。本番相当の意味検索には
