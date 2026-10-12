@@ -80,3 +80,11 @@ REPORT_CHUNK_CHARS = _int("REPORT_CHUNK_CHARS", 12000)
 # Nightly scheduler: 23:55 same-day report + 06:00 force-regen of yesterday
 # (TZ_DEFAULT). Failures are logged only (fail-soft).
 REPORT_AUTO_ENABLED = _bool("REPORT_AUTO_ENABLED", True)
+
+# Blog auto-writing (P5-B): what the built-in LLM's generated posts become.
+# "off" = the scheduler skips blog generation entirely; "draft" (default) =
+# write into drafts only (published after the user reviews); "publish" =
+# publish immediately (the pre-P5-B behavior).
+BLOG_AUTO = os.environ.get("BLOG_AUTO", "draft").strip().lower() or "draft"
+if BLOG_AUTO not in ("off", "draft", "publish"):
+    BLOG_AUTO = "draft"

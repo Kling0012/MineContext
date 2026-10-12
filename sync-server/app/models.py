@@ -179,18 +179,32 @@ class ImporterState(Base):
     )
 
 
-BLOG_POST_TYPES = ("summary", "learning")
+BLOG_POST_TYPES = ("summary", "learning", "post")
+# Publication lifecycle: drafts are only visible with an explicit status
+# filter; the public list/reader serves published posts; DELETE archives
+# (no physical delete).
+BLOG_POST_STATUSES = ("draft", "published", "archived")
 
 
 class BlogPost(Base):
-    """A generated blog article (P5). id = uuid5(date+type+topic)."""
+    """A blog article. id = uuid5(date+type+topic) for generated posts,
+    uuid4 for API/MCP-created ones."""
 
     __tablename__ = "blog_posts"
     __table_args__ = (
         CheckConstraint(
-            "type IN ('summary','learning')", name="ck_blog_posts_type"
+            "type IN ('summary','learning','post')", name="ck_blog_posts_type"
+        ),
+        CheckConstraint(
+            "status IN ('draft','published','archived')",
+            name="ck_blog_posts_status",
+        ),
+        CheckConstraint(
+            "author IN ('me','auto') OR author LIKE 'agent:%'",
+            name="ck_blog_posts_author",
         ),
         Index("ix_blog_posts_date", "date"),
+        Index("ix_blog_posts_status", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
@@ -209,6 +223,15 @@ class BlogPost(Base):
         server_default=sa_text("'{}'::uuid[]"),
     )
     model: Mapped[str] = mapped_column(Text, nullable=False)
+    # draft (existing rows default to published via the migration) /
+    # published / archived
+    status: Mapped[str] = mapped_column(
+        Text, nullable=False, default="draft", server_default=sa_text("'draft'")
+    )
+    # "auto" = built-in LLM, "me" = the user, "agent:<name>" = an external AI
+    author: Mapped[str] = mapped_column(
+        Text, nullable=False, default="auto", server_default=sa_text("'auto'")
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

@@ -12,6 +12,7 @@ DC="sudo docker compose -p mcsync-e2e"
 PASS=0
 FAIL=0
 DAY="$(date +%F)"
+PDAY="$(date -d '-1 day' +%F)"   # §4-6 events: yesterday (always past)
 
 ok()   { PASS=$((PASS+1)); echo "PASS: $1"; }
 bad()  { FAIL=$((FAIL+1)); echo "FAIL: $1"; }
@@ -68,14 +69,14 @@ mk() { # mk id device kind started text title
   printf '{"id":"%s","device_id":"%s","kind":"%s","started_at":"%s","text":%s,"title":%s}' \
     "$1" "$2" "$3" "$4" "$(jq -Rn --arg v "$5" '$v')" "$(jq -Rn --arg v "$6" '$v')"
 }
-B1="{\"device_id\":\"mac-1\",\"events\":[$(mk $E1 mac-1 note "${DAY}T09:00:00+09:00" '四半期財務レポートのレビューをした' 'Q3 finances'),$(mk $E3 mac-1 activity "${DAY}T11:00:00+09:00" 'VS Code で Python のコードを書いた' 'coding')]}"
-B2="{\"device_id\":\"win-1\",\"events\":[$(mk $E2 win-1 screen_summary "${DAY}T10:00:00+09:00" '会議の議事録: 予算について議論' 'meeting notes')]}"
+B1="{\"device_id\":\"mac-1\",\"events\":[$(mk $E1 mac-1 note "${PDAY}T09:00:00+09:00" '四半期財務レポートのレビューをした' 'Q3 finances'),$(mk $E3 mac-1 activity "${PDAY}T11:00:00+09:00" 'VS Code で Python のコードを書いた' 'coding')]}"
+B2="{\"device_id\":\"win-1\",\"events\":[$(mk $E2 win-1 screen_summary "${PDAY}T10:00:00+09:00" '会議の議事録: 予算について議論' 'meeting notes')]}"
 R=$(req POST "/v1/events:batch" "$B1")
 check "$(echo "$R" | jq -r '"\(.accepted)/\(.updated)"')" "2/0" "batch mac-1 accepted/updated"
 R=$(req POST "/v1/events:batch" "$B2")
 check "$(echo "$R" | jq -r '"\(.accepted)/\(.updated)"')" "1/0" "batch win-1 accepted/updated"
 # same ids again with updated text -> updated, not duplicated
-B1U="{\"device_id\":\"mac-1\",\"events\":[$(mk $E1 mac-1 note "${DAY}T09:00:00+09:00" '四半期財務レポートのレビューを完了した' 'Q3 finances v2')]}"
+B1U="{\"device_id\":\"mac-1\",\"events\":[$(mk $E1 mac-1 note "${PDAY}T09:00:00+09:00" '四半期財務レポートのレビューを完了した' 'Q3 finances v2')]}"
 R=$(req POST "/v1/events:batch" "$B1U")
 check "$(echo "$R" | jq -r '"\(.accepted)/\(.updated)"')" "0/1" "re-ingest same id -> updated"
 T=$(req GET "/v1/events?device_id=mac-1&limit=10" | jq -r '.events[] | select(.id=="'$E1'") | .text')
@@ -90,7 +91,7 @@ done
 check "$P" "0" "embed_pending drains to 0 (fake provider)"
 
 echo "=== 6. days: both devices chronological + kind counts"
-D=$(req GET "/v1/days/${DAY}?tz=Asia/Tokyo")
+D=$(req GET "/v1/days/${PDAY}?tz=Asia/Tokyo")
 N=$(echo "$D" | jq '.events | length')
 check "$N" "3" "days returns 3 events"
 ORDER=$(echo "$D" | jq -r '[.events[].device_id] | join(",")')
@@ -391,7 +392,7 @@ JD=$(echo "$ST" | jq -c ".days[] | select(.date==\"$DAY\")")
 check "$(echo "$JD" | jq '.session_minutes >= 60')" "true" "cross-midnight session gives DAY its 60min part"
 STU=$(req GET "/v1/stats/daily?from=${DAY}&to=${D1}&tz=UTC")
 check "$(echo "$STU" | jq -r ".days[] | select(.date==\"$D1\") | [.events,.mine] | @tsv")" "0	0" "tz=UTC: boundary event not on DAY+1"
-check "$(echo "$STU" | jq '.days[] | select(.date=="'$DAY'") | .mine >= 4')" "true" "tz=UTC: boundary event counted on DAY instead"
+check "$(echo "$STU" | jq '.days[] | select(.date=="'$DAY'") | .mine >= 2')" "true" "tz=UTC: boundary event counted on DAY instead"
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/stats/daily?from=${DAY}&to=$(date -d '+401 day' +%F)")
 check "$CODE" "422" "range over 400 days -> 422"
 
@@ -468,6 +469,7 @@ check "$N" "0" "failed blog generation stores nothing"
 
 echo "=== 19. blog (fake): both types, idempotent, force, list/detail/tags"
 if ! sudo env EMBED_PROVIDER=fake LLM_PROVIDER=fake SESSION_JUDGE_INTERVAL=600 IDLE_MINUTES=15 \
+     BLOG_AUTO=publish \
      AM_BASE_URL=http://fake-agent-memory:8377 AM_IMPORT_INTERVAL=3 \
      docker compose -p mcsync-e2e up -d api >/dev/null 2>&1; then
   bad "recreate api with fake providers (blog)"
@@ -486,6 +488,8 @@ check "$(echo "$BG" | jq -r .summary.post.id)" "$SUMID" "summary id is uuid5(dat
 check "$(echo "$BG" | jq -r .summary.post.slug)" "${DAY}-summary" "summary slug"
 check "$(echo "$BG" | jq -r .summary.post.type)" "summary" "summary type"
 check "$(echo "$BG" | jq -r .summary.post.model)" "fake" "summary model=fake"
+check "$(echo "$BG" | jq -r .summary.post.status)" "published" "BLOG_AUTO=publish publishes generated posts"
+check "$(echo "$BG" | jq -r .summary.post.author)" "auto" "generated post author=auto"
 TL=$(req GET "/v1/timeline?date=${DAY}&tz=Asia/Tokyo")
 AIW=$(echo "$TL" | jq '[.items[] | select(.type=="ai_work")] | length')
 MATS=$(echo "$TL" | jq '[.items[] | select(.type=="event" and (.event.kind=="activity" or .event.kind=="screen_summary"))] | length')
@@ -561,6 +565,100 @@ check "$CODE" "422" "embeddings: empty input -> 422"
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/embeddings" \
   -H 'Content-Type: application/json' -d '{"model":"m","input":"x","input_type":"bogus"}')
 check "$CODE" "422" "embeddings: bad input_type -> 422"
+
+echo "=== 21. blog authoring (P5-B): materials, draft/publish/archive, MCP"
+if ! sudo env EMBED_PROVIDER=fake LLM_PROVIDER=fake SESSION_JUDGE_INTERVAL=600 IDLE_MINUTES=15 \
+     AM_BASE_URL=http://fake-agent-memory:8377 AM_IMPORT_INTERVAL=3 \
+     docker compose -p mcsync-e2e up -d api >/dev/null 2>&1; then
+  bad "recreate api with fake providers (authoring)"
+fi
+HZ=""
+for i in $(seq 1 60); do
+  HZ=$(curl -s "$BASE/healthz" || true)
+  echo "$HZ" | jq -e '.ok == true' >/dev/null 2>&1 && break
+  sleep 1
+done
+echo "$HZ" | jq -e '.ok == true' >/dev/null 2>&1 && ok "api back on fake providers (authoring)" || bad "api did not come back: $HZ"
+# BLOG_AUTO default (draft): generated posts land in drafts, not the public list
+BGD3=$(req POST /v1/blog/generate "{\"date\":\"${D3}\"}")
+check "$(echo "$BGD3" | jq -r .summary.post.status)" "draft" "BLOG_AUTO default draft: generated post is a draft"
+check "$(echo "$BGD3" | jq -r .summary.post.author)" "auto" "generated post author=auto (default mode)"
+check "$(echo "$(req GET '/v1/blog/posts')" | jq '[.posts[].slug] | index("'"$(echo "$BGD3" | jq -r .summary.post.slug)"'") != null')" "false" "draft summary hidden from the default list"
+check "$(echo "$(req GET "/v1/blog/posts?status=draft")" | jq '[.posts[].slug] | index("'"$(echo "$BGD3" | jq -r .summary.post.slug)"'") != null')" "true" "draft summary visible with ?status=draft"
+# materials endpoint: counts line up with the timeline, report body included
+TL=$(req GET "/v1/timeline?date=${DAY}&tz=Asia/Tokyo")
+MT=$(req GET "/v1/blog/materials?date=${DAY}")
+check "$(echo "$MT" | jq -r '.daily_report != null')" "true" "materials include the daily report body"
+check "$(echo "$MT" | jq '.counts.sessions')" "$(echo "$TL" | jq '.session_totals | length')" "materials counts.sessions matches timeline"
+check "$(echo "$MT" | jq '.counts.ai_work')" "$(echo "$TL" | jq '[.items[] | select(.type=="ai_work")] | length')" "materials counts.ai_work matches timeline"
+check "$(echo "$MT" | jq '(.own_records | length) == (.counts.activity + .counts.screen_summary)')" "true" "materials own_records cover activity+screen_summary"
+check "$(echo "$MT" | jq -r '.sessions[0] | has("minutes") and has("title")')" "true" "materials sessions carry title+minutes"
+MT1=$(req GET "/v1/blog/materials?date=${DAY}&max_records=1")
+check "$(echo "$MT1" | jq -r .counts.own_records_truncated)" "true" "materials max_records caps and flags truncation"
+# create a draft via the authoring API (secrets get masked)
+CB=$(jq -n --arg d "$DAY" '{title:"AIが書いた記事",markdown:"## 導入\n\n認証トークンは Bearer abcdefghijklmnopqrstuvwxyz012345 を使わない。\n\n本文。",date:$d,type:"post",tags:["e2e","agent"],author:"agent:claude"}')
+NEW=$(req POST /v1/blog/posts "$CB")
+SLUG=$(echo "$NEW" | jq -r .slug)
+check "$(echo "$SLUG" | grep -cE "^${DAY}-[a-z0-9]{8}$")" "1" "created post slug is date + short alnum id"
+check "$(echo "$NEW" | jq -r .status)" "draft" "created post starts as a draft"
+check "$(echo "$NEW" | jq -r .author)" "agent:claude" "created post author kept"
+check "$(echo "$NEW" | jq -r .type)" "post" "created post type=post"
+check "$(echo "$NEW" | jq -r '.markdown | contains("Bearer ***")')" "true" "bearer token masked on create"
+check "$(echo "$NEW" | jq -r '.markdown | contains("abcdefghijklmnopqrstuvwxyz012345")')" "false" "masked token not stored"
+check "$(echo "$NEW" | jq -r '.excerpt | length >= 1')" "true" "excerpt auto-generated when absent"
+check "$(echo "$(req GET '/v1/blog/posts')" | jq '[.posts[].slug] | index("'"$SLUG"'") != null')" "false" "draft hidden from the public list"
+check "$(echo "$(req GET '/v1/blog/posts?status=draft')" | jq '[.posts[].slug] | index("'"$SLUG"'") != null')" "true" "draft visible with ?status=draft"
+# PATCH / publish / unpublish
+UP=$(req PATCH "/v1/blog/posts/$SLUG" '{"title":"AIが書いた記事（改）","tags":["e2e"]}')
+check "$(echo "$UP" | jq -r .title)" "AIが書いた記事（改）" "PATCH updates title"
+check "$(echo "$UP" | jq -r '.tags | join(",")')" "e2e" "PATCH updates tags"
+check "$(echo "$UP" | jq -r .status)" "draft" "PATCH keeps draft"
+PB=$(req POST "/v1/blog/posts/$SLUG/publish")
+check "$(echo "$PB" | jq -r .status)" "published" "publish -> published"
+check "$(echo "$(req GET '/v1/blog/posts')" | jq '[.posts[].slug] | index("'"$SLUG"'") != null')" "true" "published post in the public list"
+UB=$(req POST "/v1/blog/posts/$SLUG/unpublish")
+check "$(echo "$UB" | jq -r .status)" "draft" "unpublish -> draft"
+check "$(echo "$(req GET '/v1/blog/posts')" | jq '[.posts[].slug] | index("'"$SLUG"'") != null')" "false" "unpublished post leaves the public list"
+# rewrite: proposal only, nothing saved
+RW=$(req POST "/v1/blog/posts/$SLUG/rewrite" '{"instruction":"もう少しカジュアルに"}')
+check "$(echo "$RW" | jq -r '.markdown | contains("fake rewrite")')" "true" "rewrite (fake) returns a rewritten markdown"
+check "$(echo "$RW" | jq -r .title)" "$(echo "$UP" | jq -r .title)" "rewrite keeps the title (fake)"
+check "$(req GET "/v1/blog/posts/$SLUG?status=draft" | jq -r '.markdown | contains("fake rewrite")')" "false" "rewrite does not save"
+# DELETE archives only
+DEL=$(req DELETE "/v1/blog/posts/$SLUG")
+check "$(echo "$DEL" | jq -r .status)" "archived" "DELETE archives the post"
+check "$(echo "$(req GET '/v1/blog/posts?status=archived')" | jq '[.posts[].slug] | index("'"$SLUG"'") != null')" "true" "archived post visible with ?status=archived"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/blog/posts/$SLUG")
+check "$CODE" "404" "archived post hidden from the default detail view"
+check "$(req DELETE "/v1/blog/posts/$SLUG" | jq -r .status)" "archived" "second DELETE is idempotent"
+# MCP: initialize -> tools/list -> hibi_create_draft -> hibi_publish_post
+mcprpc() {
+  curl -s -X POST "$BASE/mcp" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -d "$1"
+}
+INIT=$(mcprpc '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"1.0"}}}')
+check "$(echo "$INIT" | jq -r .jsonrpc)" "2.0" "MCP initialize responds over /mcp"
+check "$(echo "$INIT" | jq -r .result.serverInfo.name)" "hibi" "MCP serverInfo.name=hibi"
+TOOLS=$(mcprpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
+check "$(echo "$TOOLS" | jq '.result.tools | length')" "9" "MCP tools/list returns 9 tools"
+check "$(echo "$TOOLS" | jq -r '[.result.tools[].name] | index("hibi_create_draft") != null')" "true" "MCP tool list includes hibi_create_draft"
+check "$(echo "$TOOLS" | jq -r '[.result.tools[].name] | index("hibi_publish_post") != null')" "true" "MCP tool list includes hibi_publish_post"
+CALL=$(jq -n --arg d "$DAY" '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"hibi_create_draft",arguments:{title:"MCP経由の下書き",markdown:"## MCP\n\n下書きを作る。",date:$d,author_name:"claude"}}}')
+MC=$(mcprpc "$CALL")
+MSLUG=$(echo "$MC" | jq -r '.result.structuredContent.slug // (.result.content[0].text | fromjson | .slug)')
+check "$(echo "$MSLUG" | grep -cE "^${DAY}-[a-z0-9]{8}$")" "1" "MCP hibi_create_draft returns a slug"
+MP=$(req GET "/v1/blog/posts/$MSLUG?status=draft")
+check "$(echo "$MP" | jq -r .author)" "agent:claude" "MCP-created draft author=agent:<name>"
+check "$(echo "$MP" | jq -r .status)" "draft" "MCP-created post is a draft"
+MC2=$(mcprpc "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"hibi_publish_post\",\"arguments\":{\"slug\":\"$MSLUG\"}}}")
+check "$(echo "$MC2" | jq -r '.result.structuredContent.status // (.result.content[0].text | fromjson | .status)')" "published" "MCP hibi_publish_post publishes the draft"
+check "$(echo "$(req GET '/v1/blog/posts')" | jq '[.posts[].slug] | index("'"$MSLUG"'") != null')" "true" "MCP-published post in the public list"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/mcp" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"no_such_tool","arguments":{}}}')
+check "$CODE" "200" "MCP unknown tool answers JSON-RPC (error inside), HTTP stays 200"
+check "$(curl -s "$BASE/healthz" | jq -r .ok)" "true" "server stays up after MCP calls"
 
 echo
 echo "results: PASS=$PASS FAIL=$FAIL"

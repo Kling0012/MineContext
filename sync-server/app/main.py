@@ -36,10 +36,14 @@ from .schemas import (
     BlogGenerateIn,
     BlogGenerateOut,
     BlogPostBrief,
+    BlogPostCreateIn,
     BlogPostDetail,
     BlogPostOut,
+    BlogPostPatchIn,
     BlogPostRef,
     BlogPostsPage,
+    BlogRewriteIn,
+    BlogRewriteOut,
     BlogTagOut,
     DailyStat,
     DailyStatsResponse,
@@ -87,12 +91,29 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(am_import.am_import_worker()),
         asyncio.create_task(daily_report.report_scheduler()),
     ]
-    yield
-    for task in tasks:
-        task.cancel()
-    for task in tasks:
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+    # The MCP session manager runs for the app's whole lifetime (mounting it
+    # does not start it by itself). A failure here must not take the REST
+    # API down: enter/exit are guarded so only /mcp would misbehave.
+    mcp_cm = None
+    try:
+        from . import mcp_server
+
+        mcp_cm = mcp_server.mcp.session_manager.run()
+        await mcp_cm.__aenter__()
+    except Exception as e:  # noqa: BLE001 - fail-soft: MCP only
+        log.error("MCP session manager failed to start: %s", e)
+        mcp_cm = None
+    try:
+        yield
+    finally:
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if mcp_cm is not None:
+            with contextlib.suppress(Exception):
+                await mcp_cm.__aexit__(None, None, None)
 
 
 app = FastAPI(title="MineContext sync-server", lifespan=lifespan)
@@ -315,14 +336,52 @@ def search(body: SearchIn, db: Session = Depends(get_db)):
     for k in body.kinds or []:
         if k not in EVENT_KINDS:
             raise HTTPException(status_code=422, detail=f"unknown kind: {k}")
-    params: dict = {"q": body.query}
-    shared = _search_filters(params, body.kinds, body.device_ids, body.from_, body.to)
+    hits = _hybrid_search(
+        db,
+        body.query,
+        kinds=body.kinds,
+        device_ids=body.device_ids,
+        from_=body.from_,
+        to=body.to,
+        k=body.k,
+    )
+    return SearchResponse(
+        query=body.query,
+        hits=[
+            SearchHit(
+                event=h["event"],
+                score=h["score"],
+                vector_rank=h["vector_rank"],
+                trgm_rank=h["trgm_rank"],
+            )
+            for h in hits
+        ],
+    )
 
-    # Vector side: cosine distance over events that have embeddings.
-    # Runs on its own connection so a failure here never poisons the
-    # transaction used by the trgm side below.
+
+def _hybrid_search(
+    db: Session,
+    query: str,
+    *,
+    kinds=None,
+    device_ids=None,
+    from_=None,
+    to=None,
+    k: int = 20,
+) -> list[dict]:
+    """Hybrid search core shared by POST /v1/search and the MCP server.
+
+    Vector side (cosine over embeddings) + trgm side (similarity), merged
+    with RRF k=60. The vector side is best-effort: on failure it is skipped
+    and the trgm side still answers (fail-soft).
+    """
+    params: dict = {"q": query}
+    shared = _search_filters(params, kinds, device_ids, from_, to)
+
+    # Vector side runs on its own connection so a failure here never poisons
+    # the transaction used by the trgm side below.
     try:
-        qvec = embed_sync([body.query])[0]
+        qvec = embed_sync([query])[0]
         params["qv"] = "[" + ",".join(f"{x:.8g}" for x in qvec) + "]"
         with engine.connect() as conn:
             vec_rows = conn.execute(
@@ -355,9 +414,9 @@ def search(body: SearchIn, db: Session = Depends(get_db)):
     for ranks in (vec_ranks, trgm_ranks):
         for eid, rank in ranks.items():
             scores[eid] = scores.get(eid, 0.0) + 1.0 / (rrf_k + rank)
-    top = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))[: body.k]
+    top = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))[:k]
     if not top:
-        return SearchResponse(query=body.query, hits=[])
+        return []
 
     ids = [t[0] for t in top]
     rows = db.execute(
@@ -366,22 +425,22 @@ def search(body: SearchIn, db: Session = Depends(get_db)):
         .where(Event.id.in_(ids))
     ).fetchall()
     by_id = {ev.id: (ev, name) for ev, name in rows}
-    hits = []
+    out: list[dict] = []
     for eid, score in top:
         if eid not in by_id:
             continue
         ev, name = by_id[eid]
-        out = EventOut.model_validate(ev)
-        out.device_name = name
-        hits.append(
-            SearchHit(
-                event=out,
-                score=score,
-                vector_rank=vec_ranks.get(eid),
-                trgm_rank=trgm_ranks.get(eid),
-            )
+        event_out = EventOut.model_validate(ev)
+        event_out.device_name = name
+        out.append(
+            {
+                "event": event_out,
+                "score": score,
+                "vector_rank": vec_ranks.get(eid),
+                "trgm_rank": trgm_ranks.get(eid),
+            }
         )
-    return SearchResponse(query=body.query, hits=hits)
+    return out
 
 
 @app.post("/v1/embeddings", response_model=EmbeddingsOut)
@@ -866,20 +925,36 @@ def _blog_encode_cursor(d: date, ts: datetime, id_: uuid.UUID) -> str:
     return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
 
 
+def _blog_status_cond(status: str | None):
+    """Default (None) serves published posts only — the public reader's
+    view; ?status=draft|published|archived narrows, ?status=all disables."""
+    if status is None:
+        return BlogPost.status == "published"
+    if status != "all":
+        if status not in blog.POST_STATUSES:
+            raise HTTPException(status_code=422, detail=f"unknown status: {status}")
+        return BlogPost.status == status
+    return None
+
+
 @app.get("/v1/blog/posts", response_model=BlogPostsPage)
 def list_blog_posts(
     type_: str | None = Query(default=None, alias="type"),
     tag: str | None = Query(default=None),
     q: str | None = Query(default=None),
+    status: str | None = Query(default=None),
     from_: date | None = Query(default=None, alias="from"),
     to: date | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
     cursor: str | None = Query(default=None),
     db: Session = Depends(get_db),
 ):
-    if type_ is not None and type_ not in blog.BLOG_TYPES:
+    if type_ is not None and type_ not in blog.POST_TYPES:
         raise HTTPException(status_code=422, detail=f"unknown type: {type_}")
     conds = []
+    status_cond = _blog_status_cond(status)
+    if status_cond is not None:
+        conds.append(status_cond)
     if type_ is not None:
         conds.append(BlogPost.type == type_)
     if tag is not None:
@@ -914,24 +989,38 @@ def list_blog_posts(
 
 
 @app.get("/v1/blog/posts/{slug}", response_model=BlogPostDetail)
-def get_blog_post(slug: str, db: Session = Depends(get_db)):
-    p = db.scalars(select(BlogPost).where(BlogPost.slug == slug)).first()
+def get_blog_post(
+    slug: str,
+    status: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    status_cond = _blog_status_cond(status)
+    q = select(BlogPost).where(BlogPost.slug == slug)
+    if status_cond is not None:
+        q = q.where(status_cond)
+    p = db.scalars(q).first()
     if p is None:
         raise HTTPException(status_code=404, detail="post not found")
     key = tuple_(BlogPost.date, BlogPost.created_at, BlogPost.id)
-    # chronological neighbors: prev = closest older, next = closest newer
-    prev = db.scalars(
+    # chronological neighbors within the same status scope:
+    # prev = closest older, next = closest newer
+    prev_q = (
         select(BlogPost)
         .where(key < (p.date, p.created_at, p.id))
         .order_by(BlogPost.date.desc(), BlogPost.created_at.desc(), BlogPost.id.desc())
         .limit(1)
-    ).first()
-    nxt = db.scalars(
+    )
+    nxt_q = (
         select(BlogPost)
         .where(key > (p.date, p.created_at, p.id))
         .order_by(BlogPost.date.asc(), BlogPost.created_at.asc(), BlogPost.id.asc())
         .limit(1)
-    ).first()
+    )
+    if status_cond is not None:
+        prev_q = prev_q.where(status_cond)
+        nxt_q = nxt_q.where(status_cond)
+    prev = db.scalars(prev_q).first()
+    nxt = db.scalars(nxt_q).first()
     out = BlogPostDetail.model_validate(p)
     out.prev = BlogPostRef(slug=prev.slug, title=prev.title) if prev else None
     out.next = BlogPostRef(slug=nxt.slug, title=nxt.title) if nxt else None
@@ -941,6 +1030,7 @@ def get_blog_post(slug: str, db: Session = Depends(get_db)):
 _BLOG_TAGS_SQL = sql_text(
     "SELECT t.tag AS tag, count(*) AS count "
     "FROM blog_posts p, unnest(p.tags) AS t(tag) "
+    "WHERE p.status = 'published' "
     "GROUP BY t.tag ORDER BY count(*) DESC, t.tag"
 )
 
@@ -949,6 +1039,126 @@ _BLOG_TAGS_SQL = sql_text(
 def list_blog_tags(db: Session = Depends(get_db)):
     rows = db.execute(_BLOG_TAGS_SQL).mappings().fetchall()
     return [BlogTagOut(tag=r["tag"], count=r["count"]) for r in rows]
+
+
+# --- Blog authoring (P5-B): writing API for external AIs and the user ---
+
+
+@app.get("/v1/blog/materials")
+def get_blog_materials(
+    date_: date = Query(alias="date"),
+    tz: str | None = Query(default=None),
+    max_records: int = Query(default=200, ge=1, le=500),
+    chars: int = Query(default=500, ge=1, le=4000),
+    ai_chars: int = Query(default=2000, ge=1, le=8000),
+    include_report: bool = Query(default=True),
+    db: Session = Depends(get_db),
+):
+    """A day's writing material as JSON (sessions + own records + ai_work +
+    the daily report). Long texts are truncated to the given lengths, never
+    LLM-summarized — the caller (an AI) writes the article."""
+    tz_name = tz or config.TZ_DEFAULT
+    try:
+        ZoneInfo(tz_name)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"unknown tz: {tz_name}") from e
+    return blog.blog_materials(
+        db,
+        date_,
+        tz_name,
+        max_records=max_records,
+        chars=chars,
+        ai_chars=ai_chars,
+        include_report=include_report,
+    )
+
+
+def _get_blog_post(db: Session, slug: str) -> BlogPost:
+    p = db.scalars(select(BlogPost).where(BlogPost.slug == slug)).first()
+    if p is None:
+        raise HTTPException(status_code=404, detail="post not found")
+    return p
+
+
+@app.post("/v1/blog/posts", response_model=BlogPostOut)
+def create_blog_post(body: BlogPostCreateIn, db: Session = Depends(get_db)):
+    """Create a post (authoring API). slug = date + short alnum id; secrets
+    are masked; the excerpt is generated when absent. Drafts are invisible
+    to the public list until published."""
+    try:
+        post = blog.create_post(
+            db,
+            title=body.title,
+            markdown=body.markdown,
+            day=body.date,
+            type_=body.type,
+            tags=body.tags,
+            author=body.author,
+            status=body.status,
+            excerpt=body.excerpt,
+        )
+    except blog.BlogError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return BlogPostOut.model_validate(post)
+
+
+@app.patch("/v1/blog/posts/{slug}", response_model=BlogPostOut)
+def patch_blog_post(
+    slug: str, body: BlogPostPatchIn, db: Session = Depends(get_db)
+):
+    post = _get_blog_post(db, slug)
+    try:
+        post = blog.update_post(
+            db,
+            post,
+            title=body.title,
+            markdown=body.markdown,
+            tags=body.tags,
+            excerpt=body.excerpt,
+            status=body.status,
+        )
+    except blog.BlogError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    return BlogPostOut.model_validate(post)
+
+
+@app.post("/v1/blog/posts/{slug}/publish", response_model=BlogPostOut)
+def publish_blog_post(slug: str, db: Session = Depends(get_db)):
+    post = _get_blog_post(db, slug)
+    post.status = "published"
+    db.commit()
+    return BlogPostOut.model_validate(post)
+
+
+@app.post("/v1/blog/posts/{slug}/unpublish", response_model=BlogPostOut)
+def unpublish_blog_post(slug: str, db: Session = Depends(get_db)):
+    post = _get_blog_post(db, slug)
+    post.status = "draft"
+    db.commit()
+    return BlogPostOut.model_validate(post)
+
+
+@app.delete("/v1/blog/posts/{slug}", response_model=BlogPostOut)
+def delete_blog_post(slug: str, db: Session = Depends(get_db)):
+    """Archive only — no physical delete (the row and slug stay reserved)."""
+    post = _get_blog_post(db, slug)
+    post.status = "archived"
+    db.commit()
+    return BlogPostOut.model_validate(post)
+
+
+@app.post("/v1/blog/posts/{slug}/rewrite", response_model=BlogRewriteOut)
+def rewrite_blog_post(
+    slug: str, body: BlogRewriteIn, db: Session = Depends(get_db)
+):
+    """Ask the built-in LLM for a rewritten version of a post. The result is
+    NOT saved — review it, then apply with PATCH /v1/blog/posts/{slug}."""
+    post = _get_blog_post(db, slug)
+    try:
+        return blog.rewrite_post(db, post, body.instruction)
+    except blog.BlogError as e:
+        # only this request fails; the server keeps running (fail-soft)
+        raise HTTPException(status_code=502, detail=f"rewrite failed: {e}") from e
 
 
 # --- Importers (P3-A): agent-memory records -> ai_work events ---
@@ -995,3 +1205,14 @@ if _UI_DIR.is_dir():
 _BLOG_DIR = Path(__file__).parent / "blog"
 if _BLOG_DIR.is_dir():
     app.mount("/blog", StaticFiles(directory=_BLOG_DIR, html=True), name="blog")
+
+# MCP server (P5-B, AI blog authoring): streamable HTTP at /mcp. Mounted
+# last at "/" so every explicit route above keeps precedence; the sub-app
+# serves its endpoint at /mcp inside itself. Guarded so a missing/broken
+# MCP stack never takes the whole API down (fail-soft).
+try:
+    from . import mcp_server
+
+    app.mount("/", mcp_server.mcp.streamable_http_app(), name="mcp")
+except Exception as e:  # noqa: BLE001 - REST API works without MCP
+    log.error("MCP server not mounted: %s", e)

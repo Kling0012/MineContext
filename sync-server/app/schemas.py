@@ -263,6 +263,8 @@ class BlogPostOut(BaseModel):
     tags: list[str]
     source_event_ids: list[uuid.UUID]
     model: str
+    status: str
+    author: str
     created_at: datetime
     updated_at: datetime
 
@@ -278,6 +280,8 @@ class BlogPostBrief(BaseModel):
     title: str
     excerpt: str
     tags: list[str]
+    status: str
+    author: str
     updated_at: datetime
 
     model_config = {"from_attributes": True}
@@ -315,6 +319,47 @@ class BlogGenerateOut(BaseModel):
 class BlogTagOut(BaseModel):
     tag: str
     count: int
+
+
+# --- Blog authoring (P5-B): external AIs and the user writing posts ---
+
+
+class BlogPostCreateIn(BaseModel):
+    """POST /v1/blog/posts request body."""
+
+    title: str = Field(min_length=1, max_length=300)
+    markdown: str = Field(min_length=1)
+    date: date
+    type: str = Field(default="post", pattern="^(summary|learning|post)$")
+    tags: list[str] | None = None
+    # "me" (the user), "auto" (built-in LLM) or "agent:<name>" (an external AI)
+    author: str = Field(default="me", pattern="^(me|auto|agent:\\S+)$")
+    status: str = Field(default="draft", pattern="^(draft|published)$")
+    excerpt: str | None = None
+
+
+class BlogPostPatchIn(BaseModel):
+    """PATCH /v1/blog/posts/{slug} request body (only given fields change)."""
+
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    markdown: str | None = Field(default=None, min_length=1)
+    tags: list[str] | None = None
+    excerpt: str | None = None
+    status: str | None = Field(default=None, pattern="^(draft|published|archived)$")
+
+
+class BlogRewriteIn(BaseModel):
+    """POST /v1/blog/posts/{slug}/rewrite request body."""
+
+    instruction: str | None = None
+
+
+class BlogRewriteOut(BaseModel):
+    """Proposed rewrite (NOT saved; apply it with PATCH)."""
+
+    title: str
+    excerpt: str
+    markdown: str
 
 
 # --- OpenAI-compatible embeddings relay (P1-C): PC clients -> this server ---

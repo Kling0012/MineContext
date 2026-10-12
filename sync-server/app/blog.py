@@ -1,16 +1,18 @@
-"""Blog post generation (P5): a day's material -> LLM -> blog_posts rows.
+"""Blog post generation (P5) + authoring API helpers (P5-B).
 
-Two article kinds for the user's personal blog (generated right after the
-daily report):
-- summary: one readable article (800-1600 chars, plain だ・である style,
-  2-4 ## headings) about what was tackled, what progressed and what is
-  left over, built from the same material as the daily report (declared
-  sessions + own activity/screen_summary + ai_work, superseded hidden).
-- learning: up to 3 articles a day of reusable technical knowledge from
-  that day's ai_work records whose memory type is one of solution/cause/
-  experiment/result/issue plus the user's screen_summary. Fixed section
-  structure 背景 / 問題・症状 / 原因 / 対処 / 確かめ方 / 参考, the last one
-  listing the source record times and ids (memory ids, commit ids).
+Generated articles (written right after the daily report):
+- summary: one diary-style article a day from the same material as the daily
+  report (declared sessions + own activity/screen_summary + ai_work,
+  superseded hidden), first person "私", です・ます style, narrative flow
+  (one-line opening -> what was tackled -> stumbling blocks and decisions ->
+  learnings -> what is next), 2-4 headings, 1500-3000 chars.
+- learning: up to 3 articles a day of reusable technical knowledge from that
+  day's ai_work records whose memory type is one of solution/cause/
+  experiment/result/issue plus the user's screen_summary, written as a
+  technical blog post for whoever hits the same problem (a concrete symptom
+  first, then cause and fix in order; commands/configs only as code blocks
+  and only when present in the material; a final 参考 section citing source
+  record times and ids).
 
 Every prompt says "write nothing that is not in the material", and
 secret-looking strings are masked before storing (regex post-processing:
@@ -19,19 +21,23 @@ tokens such as uuids and git shas are kept so the 参考 section can cite
 memory ids and commit ids). LLM_PROVIDER=fake returns short deterministic
 Markdown (E2E). The nightly scheduler calls run_auto right after each
 daily-report slot (23:55 same day / 06:00 force-regeneration of
-yesterday); failures are logged only (fail-soft).
+yesterday); failures are logged only (fail-soft). BLOG_AUTO controls what
+generated posts become: off (skip), draft (default) or publish.
 
-Post identity is deterministic: id = uuid5(date+type+topic) and slug =
-<date>-summary | <date>-learning-<topic>, so POST /v1/blog/generate is
-idempotent; force=true regenerates the summary in place and replaces the
-day's learning posts. The summary post's `date` column is the link key the
-reader uses to jump to that day's daily report in the management UI.
+Authoring (P5-B): posts have status (draft/published/archived) and author
+("auto" / "me" / "agent:<name>"). The public list serves published posts
+only. External AIs and the user write via POST/PATCH /v1/blog/posts (and
+the MCP server); DELETE only archives. The materials endpoint/API returns
+a day's writing material as structured JSON. rewrite_post asks the built-in
+LLM for a rewritten version WITHOUT saving it (the caller PATCHes it in).
 """
 from __future__ import annotations
 
 import json
 import logging
 import re
+import secrets
+import string
 import uuid
 from datetime import date as date_type
 from datetime import datetime, timezone
@@ -66,6 +72,9 @@ def _chat(model: str, messages: list[dict]) -> str:
         raise BlogError(str(e)) from e
 
 BLOG_TYPES = ("summary", "learning")
+# Types an authoring caller (REST/MCP) may create.
+POST_TYPES = ("summary", "learning", "post")
+POST_STATUSES = ("draft", "published", "archived")
 # ai_work memory types that count as learning material.
 LEARNING_MEMORY_TYPES = ("solution", "cause", "experiment", "result", "issue")
 MAX_LEARNING_POSTS = 3
@@ -77,6 +86,13 @@ TOPIC_MAX = 8
 LEARN_AI_CHARS = 800
 LEARN_SS_CHARS = 300
 LEARN_MAX_RECORDS = 60
+# Authoring materials endpoint caps (long texts are truncated, never LLM-
+# summarized; callers can raise them via query params).
+MATERIAL_CHARS = 500
+MATERIAL_AI_CHARS = 2000
+MATERIAL_MAX_RECORDS = 200
+# Random slug suffix: date + this short id (POST/MCP-created posts).
+_SLUG_ALPHABET = string.ascii_lowercase + string.digits
 
 
 class BlogError(Exception):
@@ -193,6 +209,11 @@ def _topic_slug(topic, idx: int) -> str:
     return s or f"t{idx + 1}"
 
 
+def _auto_status() -> str:
+    """What a built-in-generated post becomes (BLOG_AUTO)."""
+    return "published" if config.BLOG_AUTO == "publish" else "draft"
+
+
 def _upsert_post(
     db: Session,
     *,
@@ -217,6 +238,8 @@ def _upsert_post(
         tags=tags,
         source_event_ids=source_event_ids,
         model=model,
+        status=_auto_status(),
+        author="auto",
     )
     stmt = pg_insert(BlogPost).values(**values)
     set_ = {k: v for k, v in values.items() if k != "id"}
@@ -232,10 +255,15 @@ def _upsert_post(
 
 def _summary_messages(day: date_type, tz_name: str, sessions_text: str, events_part: str):
     system = (
-        "あなたはPC作業ログから個人のブログ記事を書く助手です。次の規則を厳守すること:\n"
-        "- 材料に無いことは書かない。推測・創作・一般論を混ぜない。\n"
-        "- 文体は「だ・である」調。「です・ます」は使わない。\n"
-        "- 本文は800〜1600字。見出し(## )を2〜4個。H1(# )は書かない。\n"
+        "あなたはPC作業ログから、個人のブログの日記的な記事を書く助手です。"
+        "次の規則を厳守すること:\n"
+        "- 材料に無い事実は書かない。推測・創作・一般論を混ぜない。"
+        "感想や意見は本人の発言として材料にある範囲でだけ書く。\n"
+        "- 一人称は「私」。文体は「です・ます」調。\n"
+        "- 物語の流れで書く: 導入（その日を一言で表す）→ 何に取り組んだか →"
+        " つまずき・判断・発見 → 学び → 次にやること。\n"
+        "- 箇条書きは最小限（使うとしても数行）。見出し(## )は2〜4個。"
+        "H1(# )は書かない。本文は1500〜3000字。\n"
         "- 出力は JSON オブジェクトのみ。前置き・後書き・コードブロックは書かない。"
     )
     user = (
@@ -245,10 +273,12 @@ def _summary_messages(day: date_type, tz_name: str, sessions_text: str, events_p
         "## 材料2: この日の記録（時系列。activity/screen_summary=自分の作業、"
         "ai_work=AI の作業）\n"
         f"{events_part}\n\n"
-        "以上の材料だけから、何に取り組み、何が進み、何が残ったかを伝える"
-        "読み物の記事を1本書くこと。次の JSON を返すこと:\n"
-        '{"title": "記事タイトル（40字まで）", "excerpt": "リード文（120字程度）",'
-        ' "tags": ["プロジェクト名や技術名（最大5個）"], "markdown": "本文（見出し2〜4個）"}'
+        "以上の材料だけから、その日の記録を「私」の一人称で読み物として"
+        "語る記事を1本書くこと。つまずきや判断があったら、何に困りどう決めたかを"
+        "具体的に。次の JSON を返すこと:\n"
+        '{"title": "記事タイトル（内容が伝わる自然な日本語。記号で区切らない。'
+        '40字まで）", "excerpt": "リード文（120字程度）", '
+        '"tags": ["プロジェクト名や技術名（最大5個）"], "markdown": "本文（見出し2〜4個）"}'
     )
     return [
         {"role": "system", "content": system},
@@ -399,13 +429,16 @@ def _learning_ss_line(e: Event, zone: ZoneInfo) -> str:
 
 def _learning_messages(day: date_type, tz_name: str, material: str):
     system = (
-        "あなたはPC作業ログから再利用できる技術的知見をブログ記事にする助手です。"
+        "あなたはPC作業ログから、再利用できる技術的な学びをブログ記事にする助手です。"
         "次の規則を厳守すること:\n"
-        "- 材料に無いことは書かない。推測・創作・一般論を混ぜない。\n"
-        "- 手順・コマンド・設定値は材料にあるものだけを書く。\n"
-        "- 各記事の構成は「## 背景」「## 問題・症状」「## 原因」「## 対処」"
-        "「## 確かめ方」「## 参考」の6見出しをこの順ですべて使う。H1(# )は書かない。\n"
-        "- 「## 参考」には根拠となった記録の時刻 (HH:MM) と id（memory id・"
+        "- 材料に無い事実は書かない。推測・創作・一般論を混ぜない。"
+        "感想や意見は本人の発言として材料にある範囲でだけ書く。\n"
+        "- 読者は「同じ問題に当たった人（未来の本人）」。導入で症状を具体的に示し、"
+        "原因と対処を順に語る技術ブログとして書く。\n"
+        "- コマンド・設定値・コードは材料にあるものだけを、コードブロックで示す。\n"
+        "- 見出し(## )は2〜5個（例:「症状」「原因」「対処」「確かめ方」）。"
+        "H1(# )は書かない。目安として800〜2500字。\n"
+        "- 最後の「## 参考」には根拠となった記録の時刻 (HH:MM) と id（memory id・"
         "コミットID等、材料の [id: ...]）を並べる。\n"
         "- 出力は JSON オブジェクトのみ。前置き・後書き・コードブロックは書かない。"
     )
@@ -418,9 +451,10 @@ def _learning_messages(day: date_type, tz_name: str, material: str):
         f"（最大{MAX_LEARNING_POSTS}記事。材料が薄い話題は無理に作らない。"
         "学びが無ければ空配列）。各記事の topic は内容を表す半角英数字3〜8字の"
         "スラッグ。次の JSON を返すこと:\n"
-        '{"articles": [{"topic": "slug", "title": "記事タイトル（40字まで）", '
+        '{"articles": [{"topic": "slug", "title": "記事タイトル（内容が伝わる自然な'
+        '日本語。記号で区切らない。40字まで）", '
         '"excerpt": "リード文（120字程度）", "tags": ["技術名等（最大5個）"], '
-        '"markdown": "本文（6見出し構成）"}]}'
+        '"markdown": "本文"}]}'
     )
     return [
         {"role": "system", "content": system},
@@ -564,6 +598,9 @@ def generate_blog(
 
 def run_auto(day: date_type, tz_name: str, force: bool) -> bool:
     """One scheduled generation (both types); failures are logged only."""
+    if config.BLOG_AUTO == "off":
+        log.info("blog auto-generation disabled (BLOG_AUTO=off)")
+        return False
     try:
         with SessionLocal() as db:
             out = generate_blog(db, day, tz_name, list(BLOG_TYPES), force=force)
@@ -572,3 +609,230 @@ def run_auto(day: date_type, tz_name: str, force: bool) -> bool:
     except Exception as e:  # noqa: BLE001 - log and retry at the next slot
         log.warning("blog auto-generation for %s failed: %s", day, e)
         return False
+
+
+# --- authoring (P5-B): materials + create/update/rewrite for AIs and the user ---
+
+
+def _clip(text: str | None, chars: int) -> str:
+    t = text or ""
+    return t if len(t) <= chars else t[:chars] + "…"
+
+
+def blog_materials(
+    db: Session,
+    day: date_type,
+    tz_name: str,
+    *,
+    max_records: int = MATERIAL_MAX_RECORDS,
+    chars: int = MATERIAL_CHARS,
+    ai_chars: int = MATERIAL_AI_CHARS,
+    include_report: bool = True,
+) -> dict:
+    """A day's writing material as structured JSON (no LLM involved).
+
+    Long texts are truncated to the given lengths, never summarized; each
+    section is capped at max_records records (truncated flags report it).
+    """
+    zone = ZoneInfo(tz_name)
+    sessions, events, counts, window = collect_material(db, day, zone)
+    now = datetime.now(timezone.utc)
+
+    session_items = []
+    for s in sessions:
+        started = max(s.started_at, window[0])
+        end = min(s.ended_at or now, window[1])
+        minutes = max(0, int((end - started).total_seconds() // 60))
+        session_items.append(
+            {
+                "started_at": started.astimezone(zone).isoformat(),
+                "ended_at": (
+                    end.astimezone(zone).isoformat() if s.ended_at else None
+                ),
+                "minutes": minutes,
+                "title": s.title,
+                "note": s.note,
+                "status": s.status,
+                "confirmed": s.confirmed,
+            }
+        )
+
+    def own_item(e: Event) -> dict:
+        return {
+            "time": e.started_at.astimezone(zone).strftime("%H:%M"),
+            "kind": e.kind,
+            "device": e.device_id,
+            "app": e.app,
+            "title": e.title,
+            "text": _clip(e.text, chars),
+        }
+
+    def ai_item(e: Event) -> dict:
+        meta = e.meta or {}
+        return {
+            "time": e.started_at.astimezone(zone).strftime("%H:%M"),
+            "agent": (e.device_id or "?").removeprefix("agent:"),
+            "memory_type": meta.get("memory_type"),
+            "title": e.title,
+            "text": _clip(e.text, ai_chars),
+            "tags": [str(t) for t in meta.get("tags") or []],
+            "refs": [str(r) for r in meta.get("refs") or []],
+            "id": str(e.id),
+        }
+
+    own = [e for e in events if e.kind in ("activity", "screen_summary")]
+    ai = [e for e in events if e.kind == "ai_work"]
+    own_trunc = len(own) > max_records
+    ai_trunc = len(ai) > max_records
+
+    report_text = None
+    if include_report:
+        from . import daily_report
+
+        rep = db.get(Event, daily_report.report_id_for_date(day))
+        if rep is not None and rep.kind == "report":
+            report_text = rep.text
+
+    return {
+        "date": day.isoformat(),
+        "tz": tz_name,
+        "sessions": session_items,
+        "own_records": [own_item(e) for e in own[:max_records]],
+        "ai_work": [ai_item(e) for e in ai[:max_records]],
+        "daily_report": report_text,
+        "counts": {
+            "sessions": counts["sessions"],
+            "activity": counts["activity"],
+            "screen_summary": counts["screen_summary"],
+            "ai_work": counts["ai_work"],
+            "own_records_truncated": own_trunc,
+            "ai_work_truncated": ai_trunc,
+        },
+    }
+
+
+def _new_slug(db: Session, day: date_type, length: int = 8) -> str:
+    """date + short alnum id, checked unique against the table."""
+    for _ in range(20):
+        suffix = "".join(secrets.choice(_SLUG_ALPHABET) for _ in range(length))
+        slug = f"{day.isoformat()}-{suffix}"
+        if (
+            db.scalars(select(BlogPost.id).where(BlogPost.slug == slug)).first()
+            is None
+        ):
+            return slug
+    raise BlogError("could not allocate a unique slug")  # ~36^8 tries split
+
+
+_AUTHOR_RE = re.compile(r"^(me|auto|agent:\S+)$")
+
+
+def create_post(
+    db: Session,
+    *,
+    title: str,
+    markdown: str,
+    day: date_type,
+    type_: str = "post",
+    tags=None,
+    author: str = "me",
+    status: str = "draft",
+    excerpt: str | None = None,
+) -> BlogPost:
+    """Create a post via the authoring API/MCP (random short-id slug)."""
+    if type_ not in POST_TYPES:
+        raise BlogError(f"unknown blog type: {type_}")
+    if status not in ("draft", "published"):
+        raise BlogError(f"invalid status for creation: {status}")
+    if not _AUTHOR_RE.match(author):
+        raise BlogError("author must be 'me', 'auto' or 'agent:<name>'")
+    markdown = _norm_markdown(markdown)
+    post = BlogPost(
+        id=uuid.uuid4(),
+        date=day,
+        type=type_,
+        slug=_new_slug(db, day),
+        title=mask_secrets(_norm_title(title, f"無題 {day.isoformat()}")),
+        excerpt=mask_secrets(_norm_excerpt(excerpt, markdown)),
+        markdown=mask_secrets(markdown),
+        tags=_norm_tags(tags),
+        source_event_ids=[],
+        model="api",
+        status=status,
+        author=author,
+    )
+    db.add(post)
+    db.commit()
+    return post
+
+
+def update_post(
+    db: Session,
+    post: BlogPost,
+    *,
+    title=None,
+    markdown=None,
+    tags=None,
+    excerpt=None,
+    status=None,
+) -> BlogPost:
+    """PATCH-style update; text fields are masked before storing."""
+    if status is not None:
+        if status not in POST_STATUSES:
+            raise BlogError(f"unknown status: {status}")
+        post.status = status
+    if title is not None:
+        post.title = mask_secrets(_norm_title(title, post.title))
+    if markdown is not None:
+        post.markdown = mask_secrets(_norm_markdown(markdown))
+    if tags is not None:
+        post.tags = _norm_tags(tags)
+    if excerpt is not None:
+        post.excerpt = mask_secrets(_norm_excerpt(excerpt, post.markdown))
+    db.commit()
+    return post
+
+
+def _rewrite_messages(post: BlogPost, instruction: str | None) -> list[dict]:
+    system = (
+        "あなたはブログ記事を書き直す助手です。次の規則を厳守すること:\n"
+        "- 現記事にある事実は変えず、指示に無い新しい事実を付け加えない。\n"
+        "- タイトルは内容が伝わる自然な日本語（記号で区切らない）。\n"
+        "- 出力は JSON オブジェクトのみ。前置き・後書き・コードブロックは書かない。"
+    )
+    ask = instruction and instruction.strip()
+    user = (
+        "次のブログ記事を書き直してください。\n"
+        f"依頼: {ask if ask else '読みやすく自然な記事に整える'}\n\n"
+        f"## タイトル\n{post.title}\n\n## 本文\n{post.markdown}\n\n"
+        '次の JSON を返すこと: {"title": "新しいタイトル", '
+        '"excerpt": "リード文（120字程度）", "markdown": "新しい本文"}'
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def rewrite_post(db: Session, post: BlogPost, instruction: str | None) -> dict:
+    """Ask the built-in LLM for a rewritten version; NOT saved (caller
+    PATCHes it in). Returns {title, excerpt, markdown} (masked)."""
+    if config.LLM_PROVIDER == "fake":
+        ask = (instruction or "").strip() or "指示なし"
+        markdown = f"{post.markdown}\n\n（fake rewrite: {ask}）"
+        return {
+            "title": post.title,
+            "excerpt": post.excerpt,
+            "markdown": markdown,
+        }
+    if config.LLM_PROVIDER != "openai_compat":
+        raise BlogError(f"unknown LLM_PROVIDER: {config.LLM_PROVIDER}")
+    data = _parse_json_object(
+        _chat(config.REPORT_LLM_MODEL, _rewrite_messages(post, instruction))
+    )
+    markdown = _norm_markdown(data.get("markdown"))
+    return {
+        "title": mask_secrets(_norm_title(data.get("title"), post.title)),
+        "excerpt": mask_secrets(_norm_excerpt(data.get("excerpt"), markdown)),
+        "markdown": mask_secrets(markdown),
+    }

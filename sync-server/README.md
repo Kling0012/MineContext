@@ -55,6 +55,7 @@ curl -s http://127.0.0.1:18741/healthz
 | `REPORT_LLM_TIMEOUT_SEC` | `180` | 日報生成の LLM 通信タイムアウト秒（長文生成向け） |
 | `REPORT_CHUNK_CHARS` | `12000` | 材料の文字数がこれを超えたら時間帯（4時間区切り）ごとに flash モデルで要約してから統合 |
 | `REPORT_AUTO_ENABLED` | `1` | 日報の自動生成（毎日 23:55 その日分・翌 06:00 前日分を force 再生成、TZ_DEFAULT）。失敗はログのみ |
+| `BLOG_AUTO` | `draft` | ブログ自動執筆の挙動。`off`=スケジューラでの生成を停止、`draft`=自動生成記事は下書きに入るだけ（本人が確認して公開）、`publish`=即座に公開（旧動作） |
 
 注意: `EMBED_DIM` を変えると既存 DB の vector 列と不一致になるため、
 新規ボリューム（`docker compose down -v`）で初期化すること。
@@ -103,19 +104,31 @@ curl -s http://127.0.0.1:18741/healthz
   バックグラウンドスケジューラ（fail-soft）が毎日 23:55（TZ_DEFAULT）にその日分を
   生成し、翌朝 06:00 に前日分を force で再生成する（深夜の作業を含めるため）。
 - ブログ（P5、`blog_posts` テーブル）: 日報の直後にその日の記事を自動生成する。
-  2 種類: `summary`（1日1本。sessions・activity/screen_summary・ai_work から
-  800〜1600 字・だ・である調・見出し2〜4個の読み物）と `learning`
-  （type が solution/cause/experiment/result/issue の ai_work と screen_summary
-  から再利用できる技術的知見を話題ごとに最大3本。背景/問題・症状/原因/対処/
-  確かめ方/参考 の固定構成で、参考には時刻と id〔memory id・コミットID等〕）。
-  すべてのプロンプトで「材料に無いことは書かない」を明示し、保存前に
-  伏せ字処理（Bearer 値・password= 等のキー値・32文字以上のキー形状トークン。
-  uuid・git sha の hex トークンは参考掲載のため保持）を正規表現で適用。
-  id=uuid5(date+type+topic)、slug=`<date>-summary` / `<date>-learning-<topic>`
-  （冪等。`force=true` で summary は同一 id で再生成、learning は同日分を入れ替え）。
+  2 種類: `summary`（1日1本。sessions・activity/screen_summary・ai_work を材料に
+  一人称「私」・です・ます調の日記的な読み物。導入→何に取り組んだか→つまずき・
+  判断・発見→学び→次にやること の流れ、見出し2〜4個、1500〜3000 字）と
+  `learning`（type が solution/cause/experiment/result/issue の ai_work と
+  screen_summary から再利用できる技術的知見を話題ごとに最大3本。「同じ問題に
+  当たった人（未来の自分）」向けの技術ブログとして、導入で症状を具体的に示し
+  原因と対処を順に語る。コマンド・設定は材料にあるものだけコードブロックで。
+  最後の「## 参考」には根拠時刻と id〔memory id・コミットID等〕）。
+  すべてのプロンプトで「材料に無い事実は書かない」（感想・意見は本人の発言と
+  して材料にある範囲で）を明示し、保存前に伏せ字処理（Bearer 値・password= 等
+  のキー値・32文字以上のキー形状トークン。uuid・git sha の hex トークンは参考
+  掲載のため保持）を正規表現で適用。id=uuid5(date+type+topic)、
+  slug=`<date>-summary` / `<date>-learning-<topic>`（冪等。`force=true` で
+  summary は同一 id で再生成、learning は同日分を入れ替え）。
   `LLM_PROVIDER=fake` は件数のみの決定的 Markdown（e2e 用）。
   日報スケジューラの各スロット（23:55 その日分・翌 06:00 前日分 force）の直後に
-  同じ日のブログ2種類を生成（失敗はログのみ、fail-soft）。
+  同じ日のブログ2種類を生成（失敗はログのみ、fail-soft）。**自動生成記事の
+  行き先は `BLOG_AUTO`**（既定 draft＝下書きに入るだけ。off なら生成しない。
+  publish なら即公開）。
+  記事の状態と著者（P5-B）: status は `draft` / `published` / `archived`、
+  author は `"auto"`（内蔵 LLM）/ `"me"`（本人）/ `"agent:<名前>"`（外部 AI）。
+  既定の公開 API（GET /v1/blog/posts 等）は **published のみ**返す
+  （`?status=draft|published|archived|all` で切替）。DELETE は archived にする
+  だけ（物理削除しない）。執筆用の REST（materials・作成・更新・公開・rewrite）
+  と MCP（`/mcp`）は下の「AI にブログを書かせる」参照。
   閲覧画面（`app/blog/` の静的ファイル。Claude 担当）は `/blog/` として
   app/ui と同じ方式でマウント（ディレクトリが無ければマウントしない）。
 - agent-memory からの取り込み（P3-A、バックグラウンド）:
@@ -245,17 +258,81 @@ curl -s "$B/v1/reports/daily?date=2026-10-12" | jq -r .report.text
 curl -s "$B/v1/reports?from=2026-10-01T00:00:00Z&to=2026-11-01T00:00:00Z" | jq '.events[].title'
 
 # ブログ記事の生成（summary + learning。冪等。force で summary 同一 id 再生成・
-# learning 同日入替。types で単独指定も可）
+# learning 同日入替。types で単独指定も可。生成された記事の status は BLOG_AUTO 次第）
 curl -s -X POST $B/v1/blog/generate -H 'Content-Type: application/json' \
   -d '{"date":"2026-10-12","tz":"Asia/Tokyo","force":false}' \
   | jq '{summary: {slug: .summary.post.slug, generated: .summary.generated}, learning: [.learning[].post.slug]}'
-# 一覧（新しい順。type/tag/q(title・markdown 部分一致)/from/to フィルタ・cursor）
-curl -s "$B/v1/blog/posts?type=&tag=&q=&limit=20" | jq '.posts[] | {slug,date,type,title}'
-# 全文と前後の記事
+# 一覧（新しい順。既定は published のみ。type/tag/q(title・markdown 部分一致)/
+# status(draft|published|archived|all)/from/to フィルタ・cursor）
+curl -s "$B/v1/blog/posts?type=&tag=&q=&status=all&limit=20" | jq '.posts[] | {slug,date,type,title,status,author}'
+# 全文と前後の記事（?status= で下書き等も読める。前後記事は同じ status 範囲内）
 curl -s "$B/v1/blog/posts/2026-10-12-summary" | jq '{title, prev, next}'
-# タグ別件数
+# タグ別件数（published のみ）
 curl -s "$B/v1/blog/tags" | jq '.'
 ```
+
+## AI にブログを書かせる（P5-B）
+
+ブログを外部の AI（エージェント）や本人が直接書けるようにする API 群。
+認証なし（他の API と同じく tailnet 内限定）。**運用ルール: 記事は必ず
+下書き（draft）で作成し、本人が確認してから公開する。** 内蔵 LLM による
+自動執筆も既定では下書きに入るだけ（`BLOG_AUTO=draft`）。
+
+### 執筆材料を取得する
+
+```sh
+# その日の材料: 宣言された作業と時間 / 自分の記録 / AI の作業記録 / 日報本文。
+# 長文は要約せず切り詰めるだけ（chars=自分の記録、ai_chars=ai_work の切り詰め長さ、
+# max_records=各セクションの件数上限。切り詰めたら counts.*_truncated が true）。
+curl -s "$B/v1/blog/materials?date=2026-10-12" | jq '.counts, .daily_report'
+```
+
+### REST で記事を書く
+
+```sh
+# 作成（slug は date＋英数字8字の短い id。伏せ字処理は自動。excerpt 無ければ自動生成）
+curl -s -X POST $B/v1/blog/posts -H 'Content-Type: application/json' -d '{
+  "title": "Hibi のブログ機能を作った",
+  "markdown": "## 背景\n\n...",
+  "date": "2026-10-13", "type": "post",
+  "tags": ["hibi"], "author": "agent:claude", "status": "draft"
+}' | jq '{slug, status, author}'
+
+# 更新（指定項目のみ）・公開・非公開・アーカイブ
+curl -s -X PATCH $B/v1/blog/posts/<slug> -H 'Content-Type: application/json' \
+  -d '{"markdown": "## 背景\n\n（書き直し）"}' | jq '{slug, updated_at}'
+curl -s -X POST $B/v1/blog/posts/<slug>/publish  | jq .status   # -> published
+curl -s -X POST $B/v1/blog/posts/<slug>/unpublish | jq .status  # -> draft
+curl -s -X DELETE $B/v1/blog/posts/<slug>         | jq .status  # -> archived（物理削除しない）
+
+# 内蔵 LLM での書き直し案（保存しない。気に入ったら PATCH で保存）
+curl -s -X POST $B/v1/blog/posts/<slug>/rewrite -H 'Content-Type: application/json' \
+  -d '{"instruction": "導入をもう少し短く"}' | jq '.title, .markdown'
+```
+
+### MCP で書く（streamable HTTP、`/mcp`）
+
+同じアプリが MCP サーバ（公式 Python SDK、stateless・JSON 応答）を
+`/mcp` で提供する。読み取り系と書き込み系を説明で区別し、全ツールに
+「下書きを作って本人の確認を経て公開する」運用が明記されている。
+
+ツール一覧（読み取り）: `hibi_get_day_timeline(date)`,
+`hibi_search_records(query, from_time?, to_time?, kinds?)`,
+`hibi_get_blog_materials(date)`, `hibi_list_posts(status?, type?, limit?)`,
+`hibi_get_post(slug)`。
+ツール一覧（書き込み）: `hibi_create_draft(title, markdown, date, type?,
+tags?, author_name)`, `hibi_update_post(slug, ...)`,
+`hibi_publish_post(slug)`, `hibi_unpublish_post(slug)`。
+
+Claude Code への登録例:
+
+```sh
+claude mcp add --transport http hibi http://<host>:18740/mcp
+# （開発環境なら http://127.0.0.1:18741/mcp）
+```
+
+使う側の流れ: `hibi_get_blog_materials` と `hibi_get_day_timeline` で材料を集め →
+`hibi_create_draft` で下書きを作り → 本人が確認したら `hibi_publish_post`。
 
 ## E2E テスト
 
@@ -285,6 +362,13 @@ GET/一覧・404）、→ LLM 到達不能時の生成は 502 でサーバは継
 フィルタ・cursor）・全文と前後の記事・タグ別件数・404）、→ OpenAI 互換
 `/v1/embeddings` 中継（単発・複数・入力順・次元=EMBED_DIM・決定性・64 件まで・
 65 件で 422・空入力 422・不正 input_type 422・埋め込み到達不能時 502）、
+→ ブログ執筆 API（materials の件数が timeline と一致・日報本文入り・
+max_records で切り詰めフラグ・生成記事の BLOG_AUTO 既定 draft・REST での
+下書き作成〔slug=日付+短い id・伏せ字・excerpt 自動生成〕・PATCH・publish/
+unpublish で既定一覧の出し入れ・rewrite は提案のみで保存しない・DELETE は
+archived のみ・?status= フィルタ）、→ MCP `/mcp`（initialize・tools/list 9
+ツール・hibi_create_draft で下書き作成・hibi_publish_post で公開・未知ツールは
+JSON-RPC エラー）、
 を curl+jq で検証し PASS/FAIL を出す。
 終了時に `compose down -v` で環境を消す。
 
