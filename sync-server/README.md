@@ -49,6 +49,11 @@ curl -s http://127.0.0.1:18741/healthz
 | `AM_IMPORT_INTERVAL` | `300` | 取り込み周期（秒） |
 | `AM_IMPORT_LOOKBACK_HOURS` | `48` | 初回（カーソル無し）の遡り時間（時） |
 | `AM_TIMEOUT_SEC` | `15` | agent-memory 通信のタイムアウト秒 |
+| `REPORT_LLM_MODEL` | `glm-5.3` | 日報生成に使うモデル（LLM_* の設定で通信） |
+| `REPORT_LLM_FLASH_MODEL` | `glm-5.3-flash` | 材料が長い場合の時間帯ごとの事前要約に使うモデル |
+| `REPORT_LLM_TIMEOUT_SEC` | `180` | 日報生成の LLM 通信タイムアウト秒（長文生成向け） |
+| `REPORT_CHUNK_CHARS` | `12000` | 材料の文字数がこれを超えたら時間帯（4時間区切り）ごとに flash モデルで要約してから統合 |
+| `REPORT_AUTO_ENABLED` | `1` | 日報の自動生成（毎日 23:55 その日分・翌 06:00 前日分を force 再生成、TZ_DEFAULT）。失敗はログのみ |
 
 注意: `EMBED_DIM` を変えると既存 DB の vector 列と不一致になるため、
 新規ボリューム（`docker compose down -v`）で初期化すること。
@@ -83,6 +88,19 @@ curl -s http://127.0.0.1:18741/healthz
     （途中失敗しても続きから再試行）。
 
 - `importer_state`（上記）: agent-memory 取り込みのカーソルと状態
+- 日報（P3-B）: `POST /v1/reports/daily` はその日の timeline（sessions・自分の
+  activity/screen_summary・ai_work。superseded は非表示）を材料に LLM
+  （`REPORT_LLM_MODEL`。材料が長い場合は 4 時間区切りで `REPORT_LLM_FLASH_MODEL`
+  が事前要約）で日本語の Markdown 日報を生成し、`kind='report'` の event として
+  保存する。id は日付から決まる uuid5（冪等。`force=true` で再生成）、
+  device は `server`（自動登録）、`started_at` はその日の 00:00（tz）、
+  meta に `{report_type:"daily", date, tz, model, source_counts, generated_at}`。
+  日報は 6 節構成（概要 / 作業ごとの時間〔未確定に印〕 / 自分がしたこと /
+  AI がしたこと〔type/tags 利用〕 / 自分とAIの作業の関係 / 明日に持ち越すこと）で、
+  「材料に無いことは書かない」各記述に根拠時刻を括弧で添えるようプロンプトで指定。
+  `LLM_PROVIDER=fake` は材料の件数だけを並べた決定的 Markdown（e2e 用）。
+  バックグラウンドスケジューラ（fail-soft）が毎日 23:55（TZ_DEFAULT）にその日分を
+  生成し、翌朝 06:00 に前日分を force で再生成する（深夜の作業を含めるため）。
 - agent-memory からの取り込み（P3-A、バックグラウンド）:
   `GET {AM_BASE_URL}/v1/memories`（created_at 昇順・カーソルページング、クエリの
   ISO 時刻の「+」は %2B エンコード）を読み、各記録を events に upsert する。
@@ -193,6 +211,14 @@ curl -s $B/v1/importers
 #     "last_success_at":"...","last_error":null,"imported_count":12,...}]}
 curl -s -X POST $B/v1/importers/agent-memory/run
 # -> {"ok":true,"fetched":3,"upserted":3,"pages":1,"cursor_ts":"..."}
+
+# 日報の生成（材料 = その日の sessions + activity/screen_summary + ai_work）。
+# id は日付からの uuid5 で冪等。既にあるなら generated=false で既存を返す。
+curl -s -X POST $B/v1/reports/daily -H 'Content-Type: application/json' \
+  -d '{"date":"2026-10-12","tz":"Asia/Tokyo","force":false}' | jq '.generated, .report.meta.source_counts'
+# 取得・一覧
+curl -s "$B/v1/reports/daily?date=2026-10-12" | jq -r .report.text
+curl -s "$B/v1/reports?from=2026-10-01T00:00:00Z&to=2026-11-01T00:00:00Z" | jq '.events[].title'
 ```
 
 ## E2E テスト
@@ -214,7 +240,10 @@ compose の e2e プロファイルサービス `--profile e2e` として起動�
 既定で非表示・再実行で重複なし・active セッションへ紐付け）→ 偽サーバ停止中も
 サーバは動き続け（run は 502・last_error 記録）復帰後にバックグラウンドで再取り込み、
 → 日別集計 stats/daily（記録の無い日が 0・tz 境界の日付・active_minutes の丸め・
-セッションの日跨ぎ分割・期間超過 422）、を curl+jq で検証し PASS/FAIL を出す。
+セッションの日跨ぎ分割・期間超過 422）、→ 日報 reports/daily（fake: uuid5 の id・
+meta.report_type/source_counts が timeline と一致・冪等再 POST・force 再生成・
+GET/一覧・404）、→ LLM 到達不能時の生成は 502 でサーバは継続、を curl+jq で検証し
+PASS/FAIL を出す。
 終了時に `compose down -v` で環境を消す。
 
 `fake` provider はテキストの単語・文字2-gram を特徴ハッシュした決定的ベクトルで、

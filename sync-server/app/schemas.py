@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, Field
 
@@ -223,3 +223,18 @@ class ImporterRunOut(BaseModel):
     upserted: int
     pages: int
     cursor_ts: datetime | None
+
+
+class ReportDailyIn(BaseModel):
+    """POST /v1/reports/daily request body."""
+
+    date: date
+    tz: str | None = None  # default: TZ_DEFAULT
+    force: bool = False
+
+
+class ReportOut(BaseModel):
+    report: EventOut
+    # True when this call generated the report; False when an existing one
+    # was returned as-is (idempotent re-POST without force).
+    generated: bool = False

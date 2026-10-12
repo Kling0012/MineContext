@@ -15,7 +15,7 @@ from sqlalchemy import func, or_, select, text as sql_text, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from . import am_import, config
+from . import am_import, config, daily_report
 from .db import engine, get_db
 from .embedding import embed_sync, embedding_worker, pending_count
 from .links import session_links_for_times
@@ -44,6 +44,8 @@ from .schemas import (
     ImporterOut,
     ImportersPage,
     ImporterRunOut,
+    ReportDailyIn,
+    ReportOut,
     SearchHit,
     SearchIn,
     SearchResponse,
@@ -69,6 +71,7 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(embedding_worker()),
         asyncio.create_task(session_judge_worker()),
         asyncio.create_task(am_import.am_import_worker()),
+        asyncio.create_task(daily_report.report_scheduler()),
     ]
     yield
     for task in tasks:
@@ -700,6 +703,70 @@ def get_daily_stats(
     ).mappings().fetchall()
     days = [DailyStat.model_validate(r) for r in rows]
     return DailyStatsResponse(tz=tz_name, days=days)
+
+
+# --- Daily reports (P3-B): a day's timeline -> LLM -> kind='report' event ---
+
+
+def _event_out(db: Session, ev: Event) -> EventOut:
+    out = EventOut.model_validate(ev)
+    if ev.device_id:
+        d = db.get(Device, ev.device_id)
+        out.device_name = d.name if d else None
+    return out
+
+
+@app.post("/v1/reports/daily", response_model=ReportOut)
+def post_daily_report(body: ReportDailyIn, db: Session = Depends(get_db)):
+    tz_name = body.tz or config.TZ_DEFAULT
+    try:
+        ZoneInfo(tz_name)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"unknown tz: {tz_name}") from e
+    try:
+        ev, generated = daily_report.generate_daily_report(
+            db, body.date, tz_name, force=body.force
+        )
+    except daily_report.ReportError as e:
+        # only this request fails; the server keeps running (fail-soft)
+        raise HTTPException(
+            status_code=502, detail=f"daily report failed: {e}"
+        ) from e
+    return ReportOut(report=_event_out(db, ev), generated=generated)
+
+
+@app.get("/v1/reports/daily", response_model=ReportOut)
+def get_daily_report(
+    date_: date = Query(alias="date"),
+    db: Session = Depends(get_db),
+):
+    ev = db.get(Event, daily_report.report_id_for_date(date_))
+    if ev is None or ev.kind != "report":
+        raise HTTPException(status_code=404, detail="report not found")
+    return ReportOut(report=_event_out(db, ev))
+
+
+@app.get("/v1/reports", response_model=EventsPage)
+def list_reports(
+    from_: datetime | None = Query(default=None, alias="from"),
+    to: datetime | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    q = (
+        select(Event)
+        .where(Event.kind == "report")
+        .order_by(Event.started_at.asc(), Event.id.asc())
+    )
+    if from_ is not None:
+        q = q.where(Event.started_at >= from_)
+    if to is not None:
+        q = q.where(Event.started_at < to)
+    q = q.limit(limit)
+    reports = db.scalars(q).fetchall()
+    return EventsPage(
+        events=[EventOut.model_validate(r) for r in reports], next_cursor=None
+    )
 
 
 # --- Importers (P3-A): agent-memory records -> ai_work events ---

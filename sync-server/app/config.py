@@ -64,3 +64,17 @@ AM_IMPORT_INTERVAL = _int("AM_IMPORT_INTERVAL", 300)
 # First run (no cursor yet) starts this many hours back.
 AM_IMPORT_LOOKBACK_HOURS = _float("AM_IMPORT_LOOKBACK_HOURS", 48.0)
 AM_TIMEOUT_SEC = _float("AM_TIMEOUT_SEC", 15.0)
+
+# Daily report generation (P3-B): a day's timeline -> LLM -> report event.
+# Uses the LLM_* settings for transport; the report itself is written by
+# REPORT_LLM_MODEL, and over-long material is pre-summarized per time block
+# by REPORT_LLM_FLASH_MODEL before the final integration call.
+REPORT_LLM_MODEL = os.environ.get("REPORT_LLM_MODEL", "glm-5.3")
+REPORT_LLM_FLASH_MODEL = os.environ.get("REPORT_LLM_FLASH_MODEL", "glm-5.3-flash")
+# Long generation: judged ends only need 30s, a full report may need minutes.
+REPORT_LLM_TIMEOUT_SEC = _float("REPORT_LLM_TIMEOUT_SEC", 180.0)
+# Material longer than this many characters is summarized block by block.
+REPORT_CHUNK_CHARS = _int("REPORT_CHUNK_CHARS", 12000)
+# Nightly scheduler: 23:55 same-day report + 06:00 force-regen of yesterday
+# (TZ_DEFAULT). Failures are logged only (fail-soft).
+REPORT_AUTO_ENABLED = _bool("REPORT_AUTO_ENABLED", True)

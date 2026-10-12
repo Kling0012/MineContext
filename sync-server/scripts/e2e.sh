@@ -392,6 +392,71 @@ check "$(echo "$STU" | jq '.days[] | select(.date=="'$DAY'") | .mine >= 4')" "tr
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/stats/daily?from=${DAY}&to=$(date -d '+401 day' +%F)")
 check "$CODE" "422" "range over 400 days -> 422"
 
+echo "=== 17. daily report (fake): uuid5 id, idempotent, force, get, list"
+RP=$(req POST /v1/reports/daily "{\"date\":\"${DAY}\"}")
+check "$(echo "$RP" | jq -r .generated)" "true" "daily report generated (fake provider)"
+RID=$(python3 -c "import uuid;print(uuid.uuid5(uuid.NAMESPACE_URL,'minecontext:sync-server:daily-report:${DAY}'))")
+check "$(echo "$RP" | jq -r .report.id)" "$RID" "report id is uuid5 of the date"
+check "$(echo "$RP" | jq -r .report.kind)" "report" "stored as kind=report"
+check "$(echo "$RP" | jq -r .report.title)" "日報 ${DAY}" "report title"
+check "$(echo "$RP" | jq -r .report.meta.report_type)" "daily" "meta.report_type=daily"
+check "$(echo "$RP" | jq -r .report.meta.date)" "$DAY" "meta.date"
+check "$(echo "$RP" | jq -r .report.meta.model)" "fake" "meta.model=fake"
+check "$(echo "$RP" | jq -r .report.device_name)" "sync-server" "report stored on the server device"
+# source_counts must match the day's timeline material
+TL=$(req GET "/v1/timeline?date=${DAY}&tz=Asia/Tokyo")
+SES=$(echo "$TL" | jq '.session_totals | length')
+ACT=$(echo "$TL" | jq '[.items[] | select(.type=="event" and .event.kind=="activity")] | length')
+SCR=$(echo "$TL" | jq '[.items[] | select(.type=="event" and .event.kind=="screen_summary")] | length')
+AIW=$(echo "$TL" | jq '[.items[] | select(.type=="ai_work")] | length')
+SC=$(echo "$RP" | jq -c .report.meta.source_counts)
+check "$(echo "$SC" | jq -r .sessions)" "$SES" "source_counts.sessions matches timeline"
+check "$(echo "$SC" | jq -r .activity)" "$ACT" "source_counts.activity matches timeline"
+check "$(echo "$SC" | jq -r .screen_summary)" "$SCR" "source_counts.screen_summary matches timeline"
+check "$(echo "$SC" | jq -r .ai_work)" "$AIW" "source_counts.ai_work matches timeline"
+ACTLINE=$(echo "$RP" | jq -r .report.text | grep '^- activity: ')
+check "$ACTLINE" "- activity: $ACT" "fake markdown lists material counts"
+RP2=$(req POST /v1/reports/daily "{\"date\":\"${DAY}\"}")
+check "$(echo "$RP2" | jq -r .generated)" "false" "re-POST without force is idempotent"
+RP3=$(req POST /v1/reports/daily "{\"date\":\"${DAY}\",\"force\":true}")
+check "$(echo "$RP3" | jq -r .generated)" "true" "force=true regenerates"
+check "$(echo "$RP3" | jq -r .report.id)" "$RID" "force keeps the same uuid5 id"
+G=$(req GET "/v1/reports/daily?date=${DAY}")
+check "$(echo "$G" | jq -r .report.id)" "$RID" "GET reports/daily returns the saved report"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/reports/daily?date=$(date -d '+30 day' +%F)")
+check "$CODE" "404" "GET missing date -> 404"
+# report started_at is day-start in tz (JST midnight = previous day 15:00Z),
+# so query the list window in JST terms
+RF=$(date -u -d "${DAY}T00:00:00+09:00" +%Y-%m-%dT%H:%M:%SZ)
+RT=$(date -u -d "${D2}T00:00:00+09:00" +%Y-%m-%dT%H:%M:%SZ)
+L=$(req GET "/v1/reports?from=${RF}&to=${RT}")
+check "$(echo "$L" | jq '.events | length')" "1" "reports list shows the one report"
+check "$(echo "$L" | jq -r '.events[0].kind')" "report" "reports list filters kind=report"
+check "$(echo "$L" | jq -r '.events[0].id')" "$RID" "reports list returns the uuid5 report"
+
+echo "=== 18. daily report: LLM unreachable -> 502, server keeps running"
+if ! sudo env EMBED_PROVIDER=fake LLM_PROVIDER=openai_compat LLM_BASE_URL=http://10.255.255.1:1/v1 \
+     LLM_TIMEOUT_SEC=5 REPORT_LLM_TIMEOUT_SEC=5 SESSION_JUDGE_INTERVAL=600 IDLE_MINUTES=15 \
+     AM_BASE_URL=http://fake-agent-memory:8377 AM_IMPORT_INTERVAL=3 \
+     docker compose -p mcsync-e2e up -d api >/dev/null 2>&1; then
+  bad "recreate api with unreachable LLM"
+fi
+HZ=""
+for i in $(seq 1 60); do
+  HZ=$(curl -s "$BASE/healthz" || true)
+  echo "$HZ" | jq -e '.ok == true' >/dev/null 2>&1 && break
+  sleep 1
+done
+echo "$HZ" | jq -e '.ok == true' >/dev/null 2>&1 && ok "api recreated with unreachable LLM" || bad "api did not come back: $HZ"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/reports/daily" \
+  -H 'Content-Type: application/json' -d "{\"date\":\"${D2}\",\"force\":true}")
+check "$CODE" "502" "report generation reports 502 while LLM unreachable"
+check "$(curl -s "$BASE/healthz" | jq -r .ok)" "true" "server stays up when report LLM fails"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/reports/daily?date=${D2}")
+check "$CODE" "404" "failed generation stores nothing"
+G=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/reports/daily?date=${DAY}")
+check "$G" "200" "existing report untouched by the failure"
+
 echo
 echo "results: PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" = "0" ]
