@@ -19,11 +19,17 @@ def _float(name: str, default: float) -> float:
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql+psycopg://sync:sync@localhost:5432/sync"
 )
-# Provider: "fake" (deterministic, no network) or "openai_compat" (/embeddings).
+# Provider: "fake" (deterministic, no network), "openai_compat" (/embeddings),
+# or "cloudflare" (Workers AI OpenAI-compatible /embeddings; credentials from
+# an env-style file, same model as the agent-memory system).
 EMBED_PROVIDER = os.environ.get("EMBED_PROVIDER", "fake")
 EMBED_BASE_URL = os.environ.get("EMBED_BASE_URL", "").rstrip("/")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "fake-embed")
 EMBED_API_KEY_FILE = os.environ.get("EMBED_API_KEY_FILE", "")
+# "cloudflare" provider: path to an env-style file with CLOUDFLARE_ACCOUNT_ID
+# and CLOUDFLARE_API_TOKEN (secrets stay file-referenced, never in env/args).
+EMBED_CF_ENV_FILE = os.environ.get("EMBED_CF_ENV_FILE", "")
+EMBED_CF_TIMEOUT_SEC = _float("EMBED_CF_TIMEOUT_SEC", 60.0)
 EMBED_DIM = _int("EMBED_DIM", 1024)
 EMBED_INTERVAL_SEC = _int("EMBED_INTERVAL_SEC", 5)
 EMBED_BATCH = _int("EMBED_BATCH", 64)

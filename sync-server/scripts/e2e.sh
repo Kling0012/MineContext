@@ -6,7 +6,9 @@ set -u
 cd "$(dirname "$0")/.."
 
 BASE="http://127.0.0.1:${API_PORT:-18741}"
-DC="sudo docker compose"
+# Fixed project name so dev/e2e stacks never collide with the production
+# deployment (mcsync-prod, see docker-compose.prod.yml).
+DC="sudo docker compose -p mcsync-e2e"
 PASS=0
 FAIL=0
 DAY="$(date +%F)"
@@ -35,7 +37,7 @@ trap cleanup EXIT
 echo "=== 1. compose up (EMBED_PROVIDER=fake, LLM_PROVIDER=fake, short judge/idle)"
 $DC --profile e2e down -v >/dev/null 2>&1
 # NOTE: env must reach `docker compose` directly (a nested sudo would env-reset it).
-if ! sudo env EMBED_PROVIDER=fake LLM_PROVIDER=fake SESSION_JUDGE_INTERVAL=3 IDLE_MINUTES=0.2 docker compose up -d --build >/dev/null 2>&1; then
+if ! sudo env EMBED_PROVIDER=fake LLM_PROVIDER=fake SESSION_JUDGE_INTERVAL=3 IDLE_MINUTES=0.2 docker compose -p mcsync-e2e up -d --build >/dev/null 2>&1; then
   bad "docker compose up"
   echo "results: PASS=$PASS FAIL=$FAIL"; exit 1
 fi
@@ -224,7 +226,7 @@ check "$(echo "$TL" | jq -r '.total_minutes > 0')" "true" "total_minutes present
 echo "=== 14. embedder + LLM unreachable: ingest, sessions and search keep working"
 sudo env EMBED_PROVIDER=openai_compat EMBED_BASE_URL=http://10.255.255.1:1/v1 EMBED_MODEL=test \
   LLM_PROVIDER=openai_compat LLM_BASE_URL=http://10.255.255.1:1/v1 LLM_TIMEOUT_SEC=5 SESSION_JUDGE_INTERVAL=5 \
-  docker compose up -d api >/dev/null 2>&1 || bad "recreate api with unreachable providers"
+  docker compose -p mcsync-e2e up -d api >/dev/null 2>&1 || bad "recreate api with unreachable providers"
 HZ=""
 for i in $(seq 1 60); do
   HZ=$(curl -s "$BASE/healthz" || true)
@@ -275,7 +277,7 @@ $DC --profile e2e up -d fake-agent-memory >/dev/null 2>&1 || bad "start fake age
 # judge interval 600s: no judging races during this section
 if ! sudo env EMBED_PROVIDER=fake LLM_PROVIDER=fake SESSION_JUDGE_INTERVAL=600 IDLE_MINUTES=15 \
      AM_BASE_URL=http://fake-agent-memory:8377 AM_IMPORT_INTERVAL=3 \
-     docker compose up -d api >/dev/null 2>&1; then
+     docker compose -p mcsync-e2e up -d api >/dev/null 2>&1; then
   bad "recreate api with agent-memory import"
 fi
 N=0; ERR="x"
@@ -333,7 +335,7 @@ for i in $(seq 1 10); do
   sleep 1
 done
 [ -n "$ERR" ] && ok "last_error recorded while down" || bad "no last_error recorded"
-if sudo env FAKE_AM_ARGS=--extra docker compose --profile e2e up -d fake-agent-memory >/dev/null 2>&1; then
+if sudo env FAKE_AM_ARGS=--extra docker compose -p mcsync-e2e --profile e2e up -d fake-agent-memory >/dev/null 2>&1; then
   ok "fake agent-memory restarted with an extra record"
 else
   bad "fake agent-memory restart failed"

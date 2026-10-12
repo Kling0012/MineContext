@@ -1,0 +1,45 @@
+# Production override for the <sync-host> deployment (see README "本番配置 (<sync-host>)").
+# Used as:  docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#                 -p mcsync-prod up -d --build
+# The base file stays dev-shaped (127.0.0.1:18741, fake providers); everything
+# <sync-host>-specific (bind addresses, credentials mounts, cloudflare embedding,
+# GLM judge LLM, agent-memory import) is pinned here.
+name: mcsync-prod
+
+services:
+  db:
+    # Never publish the DB port; cap memory on the shared 5.8GiB host.
+    mem_limit: 768m
+
+  api:
+    mem_limit: 512m
+    environment:
+      EMBED_PROVIDER: cloudflare
+      EMBED_MODEL: "@cf/qwen/qwen3-embedding-0.6b"
+      EMBED_DIM: "1024"
+      # Workers AI rejects very large batches; 32 keeps requests well inside limits.
+      EMBED_BATCH: "32"
+      EMBED_CF_ENV_FILE: /run/secrets/cloudflare.env
+      LLM_PROVIDER: openai_compat
+      LLM_BASE_URL: https://open.bigmodel.cn/api/coding/paas/v4
+      LLM_MODEL: glm-5.3-flash
+      LLM_API_KEY_FILE: /run/secrets/zhipu-key
+      AM_BASE_URL: http://<memory-host>.<tailnet>.ts.net:8377
+      EMBED_INTERVAL_SEC: "10"
+      SESSION_JUDGE_INTERVAL: "300"
+    ports: !override
+      # Tailnet + localhost ONLY. Never 0.0.0.0 / public IP (no auth on the API).
+      - "${PROD_TAILNET_IP:-<sync-server-ip>}:${PROD_PORT:-18740}:8000"
+      - "127.0.0.1:${PROD_PORT:-18740}:8000"
+    volumes:
+      # Secrets are file-mounted read-only from /root/.config/minecontext/.
+      - /root/.config/minecontext/cloudflare.env:/run/secrets/cloudflare.env:ro
+      - /root/.config/minecontext/zhipu-key:/run/secrets/zhipu-key:ro
+    extra_hosts:
+      # Pin MagicDNS in case the container can't use the host resolver.
+      - "<memory-host>.<tailnet>.ts.net:<memory-host-ip>"
+
+volumes:
+  db-data:
+    # Fixed name so backups/inspection don't depend on the project prefix.
+    name: mcsync-prod-pgdata

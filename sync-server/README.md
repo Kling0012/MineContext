@@ -26,11 +26,14 @@ curl -s http://127.0.0.1:18741/healthz
 |---|---|---|
 | `API_PORT` | `18741` | ホスト側ポート |
 | `BIND_HOST` | `127.0.0.1` | ホスト側バインド（tailnet で公開する場合は tailscale IP 等） |
-| `EMBED_PROVIDER` | `fake` | `fake`（開発用・決定的・外部通信なし）または `openai_compat` |
+| `EMBED_PROVIDER` | `fake` | `fake`（開発用・決定的・外部通信なし）、`openai_compat`、または `cloudflare`（Workers AI。agent-memory と同じ形式） |
 | `EMBED_BASE_URL` | 空 | OpenAI 互換のベース URL（`.../v1` まで）。`openai_compat` 時必須 |
-| `EMBED_MODEL` | `fake-embed` | 埋め込みモデル名 |
+| `EMBED_MODEL` | `fake-embed` | 埋め込みモデル名（cloudflare は `@cf/qwen/qwen3-embedding-0.6b`） |
 | `EMBED_DIM` | `1024` | 埋め込み次元。**マイグレーション時に vector 列の次元として固定される** |
-| `EMBED_API_KEY_FILE` | 空 | API キーのファイルパス（秘密はファイル参照のみ） |
+| `EMBED_API_KEY_FILE` | 空 | API キーのファイルパス（秘密はファイル参照のみ。`openai_compat` 用） |
+| `EMBED_CF_ENV_FILE` | 空 | `cloudflare` 用。`CLOUDFLARE_ACCOUNT_ID`/`CLOUDFLARE_API_TOKEN` を含む env 形式ファイルのパス |
+| `EMBED_CF_TIMEOUT_SEC` | `60` | `cloudflare` 通信のタイムアウト秒 |
+| `EMBED_BATCH` | `64` | 1回の埋め込みリクエストに載せるイベント数の上限 |
 | `EMBED_INTERVAL_SEC` | `5` | バックグラウンド埋め込みの周期 |
 | `TZ_DEFAULT` | `Asia/Tokyo` | `GET /v1/days/{date}` と `GET /v1/timeline` の tz 既定値 |
 | `LLM_PROVIDER` | `openai_compat` | 作業終了判定の LLM。`openai_compat`（`/chat/completions`）または `fake`（開発用・決定的・外部通信なし） |
@@ -209,6 +212,89 @@ compose の e2e プロファイルサービス `--profile e2e` として起動�
 `fake` provider はテキストの単語・文字2-gram を特徴ハッシュした決定的ベクトルで、
 「意味検索」は n-gram 共有による近似（外部通信なし）。本番相当の意味検索には
 `openai_compat` で実埋め込みモデルを指定すること。
+
+e2e.sh の compose project 名は `mcsync-e2e` に固定している（本番 `mcsync-prod` との分離）。
+
+## `cloudflare` provider（Workers AI 埋め込み）
+
+agent-memory（記憶システム）と同じ構成: OpenAI 互換エンドポイント
+`POST https://api.cloudflare.com/client/v4/accounts/{id}/ai/v1/embeddings` に
+`{"model","input"}` を送る（Bearer トークン認証）。クエリ・文書のどちらにも
+instruction（前置き）は付けない — gateway は graphiti の OpenAI クライアントを
+同じ `/ai/v1` に向けており、embedded に前置きを追加していない
+（`agent-memory/gateway/app/graph_store.py` の `build_cloudflare_embedder_config`、
+graphiti `graphiti_core/embedder/openai.py` の `create`/`create_batch`）。
+アカウント ID とトークンは env 形式ファイル（`EMBED_CF_ENV_FILE`）から読み、
+環境変数・コマンドラインには載せない。失敗時は既存の fail-soft
+（events の保存・trgm 検索は止まらず、次周期で再試行）。
+
+## 本番配置（<sync-host>）
+
+本番は <sync-host>（Ubuntu 24.04, tailnet <sync-server-ip>）の `/opt/minecontext-sync/` で
+`docker-compose.prod.yml` を重ねて動く。compose project 名 `mcsync-prod`
+（override の `name:` と `-p` の両方で固定）、ボリューム `mcsync-prod-pgdata`。
+
+- api のバインドは `<sync-server-ip>:18740` と `127.0.0.1:18740` のみ
+  （`ports: !override` で base の開発用マッピングを置換）。**認証がないため
+  0.0.0.0 や公開 IP には絶対に bind しない。**
+- 埋め込み: `EMBED_PROVIDER=cloudflare`（`@cf/qwen/qwen3-embedding-0.6b`, 1024 次元）。
+  認証は `/root/.config/minecontext/cloudflare.env`（mode 600、
+  `CLOUDFLARE_ACCOUNT_ID`/`CLOUDFLARE_API_TOKEN`）を読み取り専用マウント。
+- LLM（作業終了判定）: `/root/.config/minecontext/zhipu-key`（600）を読み取り専用
+  マウント、`LLM_BASE_URL=https://open.bigmodel.cn/api/coding/paas/v4`、
+  `LLM_MODEL=glm-5.3-flash`。
+- agent-memory 取り込み: `AM_BASE_URL=http://<memory-host>.<tailnet>.ts.net:8377`
+  （`extra_hosts` で `<memory-host>.<tailnet>.ts.net:<memory-host-ip>` を固定）。
+- メモリ上限 api 512m / db 768m、`restart: unless-stopped`（ホスト再起動後に自動復帰）。
+- db のポートは公開しない。<sync-host> 既存の Caddy・1Panel 等には触れない。
+
+### 初回構築（<memory-host> から）
+
+```sh
+# 1) 秘密ファイルを置く（値は出力しない）
+ssh <sync-host> 'install -d -m 700 /root/.config/minecontext'
+scp -p ~/.config/minecontext/zhipu-key <sync-host>:/root/.config/minecontext/
+scp -p <(printf 'CLOUDFLARE_ACCOUNT_ID=%s\nCLOUDFLARE_API_TOKEN=%s\n' \
+  "$(grep '^CLOUDFLARE_ACCOUNT_ID=' ~/agent-memory/.env | cut -d= -f2-)" \
+  "$(grep '^CLOUDFLARE_API_TOKEN='   ~/agent-memory/.env | cut -d= -f2-)") \
+  <sync-host>:/root/.config/minecontext/cloudflare.env
+ssh <sync-host> 'chmod 600 /root/.config/minecontext/cloudflare.env /root/.config/minecontext/zhipu-key'
+
+# 2) コードを配置して起動
+rsync -a --delete --exclude .venv --exclude __pycache__ \
+  ~/dev/MineContext/sync-server/ <sync-host>:/opt/minecontext-sync/
+ssh <sync-host> 'cd /opt/minecontext-sync && docker compose -f docker-compose.yml \
+  -f docker-compose.prod.yml -p mcsync-prod up -d --build'
+```
+
+### 運用（<sync-host> 上）
+
+```sh
+cd /opt/minecontext-sync
+docker compose -f docker-compose.yml -f docker-compose.prod.yml -p mcsync-prod ps
+docker compose -f docker-compose.yml -f docker-compose.prod.yml -p mcsync-prod logs -f api
+# 停止 / 再開
+docker compose -f docker-compose.yml -f docker-compose.prod.yml -p mcsync-prod stop
+docker compose -f docker-compose.yml -f docker-compose.prod.yml -p mcsync-prod start
+```
+
+### 更新手順（<memory-host> から）
+
+```sh
+rsync -a --delete --exclude .venv --exclude __pycache__ \
+  ~/dev/MineContext/sync-server/ <sync-host>:/opt/minecontext-sync/
+ssh <sync-host> 'cd /opt/minecontext-sync && docker compose -f docker-compose.yml \
+  -f docker-compose.prod.yml -p mcsync-prod up -d --build'
+```
+
+`--delete` は `/opt/minecontext-sync/` 配下のみに効く（秘密は `/root/.config/` 別置き）。
+データ（`mcsync-prod-pgdata` ボリューム）は `down -v` しない限り消えない。
+
+### バックアップ
+
+`docker run --rm -v mcsync-prod-pgdata:/data -v /root:/backup alpine \
+  tar czf /backup/minecontext-sync-$(date +%F).tar.gz -C /data .`
+（pgdata ボリュームのスナップショット退避。`down -v` 前に必ず取る。）
 
 ## Lab（tailnet 内 Linux）への移行手順 — 未実施
 

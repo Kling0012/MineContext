@@ -3,6 +3,12 @@
 Providers:
 - "fake": deterministic pseudo-embeddings (hashed word/char n-grams), no network.
 - "openai_compat": OpenAI-compatible POST {base_url}/embeddings.
+- "cloudflare": Workers AI OpenAI-compatible endpoint
+  POST https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1/embeddings
+  with account id + API token read from an env-style file. Request/response
+  shape matches the agent-memory gateway, which points graphiti's OpenAI client
+  at the same /ai/v1 base URL with no instruction prefix on queries or
+  documents (gateway/app/graph_store.py build_cloudflare_embedder_config).
 
 The worker embeds events that have no row in event_embeddings yet. Any
 failure only skips embedding for that batch (fail-soft); event ingest and
@@ -65,6 +71,46 @@ class EmbedError(Exception):
     pass
 
 
+def _parse_openai_embeddings(body: dict, texts: list[str]) -> list[list[float]]:
+    """Parse an OpenAI-shaped /embeddings response into input order."""
+    data = body["data"]
+    vecs: list[list[float] | None] = [None] * len(texts)
+    for i, item in enumerate(data):
+        idx = item.get("index", i)  # cloudflare omits index on single inputs
+        vecs[idx] = [float(x) for x in item["embedding"]]
+    if any(v is None for v in vecs):
+        raise EmbedError("provider returned missing embeddings")
+    for v in vecs:
+        if len(v) != config.EMBED_DIM:
+            raise EmbedError(
+                f"provider dim {len(v)} != EMBED_DIM {config.EMBED_DIM}"
+            )
+    return vecs  # type: ignore[return-value]
+
+
+def _cloudflare_creds() -> tuple[str, str]:
+    """Read CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_API_TOKEN from an env-style file."""
+    path = config.EMBED_CF_ENV_FILE
+    if not path:
+        raise EmbedError("EMBED_CF_ENV_FILE is not set")
+    values: dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                values[k.strip()] = v.strip().strip("'\"")
+    except OSError as e:
+        raise EmbedError(f"cannot read cloudflare env file: {e}") from e
+    account = values.get("CLOUDFLARE_ACCOUNT_ID", "")
+    token = values.get("CLOUDFLARE_API_TOKEN", "")
+    if not account or not token:
+        raise EmbedError("cloudflare env file lacks CLOUDFLARE_ACCOUNT_ID/API_TOKEN")
+    return account, token
+
+
 def embed_sync(texts: list[str]) -> list[list[float]]:
     """Embed a batch synchronously using the configured provider."""
     if not texts:
@@ -89,18 +135,24 @@ def embed_sync(texts: list[str]) -> list[list[float]]:
                 f"{config.EMBED_BASE_URL}/embeddings", json=payload, headers=headers
             )
         resp.raise_for_status()
-        data = resp.json()["data"]
-        vecs = [None] * len(texts)
-        for item in data:
-            vecs[item["index"]] = [float(x) for x in item["embedding"]]
-        if any(v is None for v in vecs):
-            raise EmbedError("provider returned missing embeddings")
-        for v in vecs:
-            if len(v) != config.EMBED_DIM:
-                raise EmbedError(
-                    f"provider dim {len(v)} != EMBED_DIM {config.EMBED_DIM}"
-                )
-        return vecs
+        return _parse_openai_embeddings(resp.json(), texts)
+    if config.EMBED_PROVIDER == "cloudflare":
+        # Workers AI OpenAI-compat endpoint; plain model+input like the
+        # agent-memory gateway (no instruction prefix on either side).
+        account, token = _cloudflare_creds()
+        url = (
+            "https://api.cloudflare.com/client/v4/accounts/"
+            f"{account}/ai/v1/embeddings"
+        )
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        }
+        payload = {"model": config.EMBED_MODEL, "input": texts}
+        with httpx.Client(timeout=config.EMBED_CF_TIMEOUT_SEC) as client:
+            resp = client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        return _parse_openai_embeddings(resp.json(), texts)
     raise EmbedError(f"unknown EMBED_PROVIDER: {config.EMBED_PROVIDER}")
 
 
