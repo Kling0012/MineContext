@@ -262,6 +262,7 @@ ssh <sync-host> 'chmod 600 /root/.config/minecontext/cloudflare.env /root/.confi
 
 # 2) コードを配置して起動
 rsync -a --delete --exclude .venv --exclude __pycache__ \
+  --exclude backup.sh --exclude backups/ --exclude README.backup.md \
   ~/dev/MineContext/sync-server/ <sync-host>:/opt/minecontext-sync/
 ssh <sync-host> 'cd /opt/minecontext-sync && docker compose -f docker-compose.yml \
   -f docker-compose.prod.yml -p mcsync-prod up -d --build'
@@ -282,19 +283,55 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml -p mcsync-prod s
 
 ```sh
 rsync -a --delete --exclude .venv --exclude __pycache__ \
+  --exclude backup.sh --exclude backups/ --exclude README.backup.md \
   ~/dev/MineContext/sync-server/ <sync-host>:/opt/minecontext-sync/
 ssh <sync-host> 'cd /opt/minecontext-sync && docker compose -f docker-compose.yml \
   -f docker-compose.prod.yml -p mcsync-prod up -d --build'
 ```
 
 `--delete` は `/opt/minecontext-sync/` 配下のみに効く（秘密は `/root/.config/` 別置き）。
+`backup.sh` / `backups/` / `README.backup.md` は <sync-host> 固有のため exclude してある（消すと timer が壊れる）。
 データ（`mcsync-prod-pgdata` ボリューム）は `down -v` しない限り消えない。
 
 ### バックアップ
 
+<sync-host> では systemd timer（`minecontext-backup.timer`、毎日 03:20 JST）が
+`/opt/minecontext-sync/backup.sh` を実行し、`pg_dump -Fc` を
+`/opt/minecontext-sync/backups/mcsync-YYYYMMDD-HHMM.dump` に保存する。
+14 日より古い `*.dump` は自動削除。詳細・復元手順は <sync-host>:`/opt/minecontext-sync/README.backup.md` 参照。
+
+```sh
+# 状態確認・手動実行（<sync-host> 上）
+systemctl list-timers minecontext-backup.timer
+systemctl start minecontext-backup.service
+# ダンプの中身を確認
+docker exec -i mcsync-prod-db-1 pg_restore -l \
+  < /opt/minecontext-sync/backups/mcsync-XXXXXXXX-HHMM.dump | less
+```
+
+復元手順（<sync-host> 上。DB を作り直すため実行前に確認すること）:
+
+```sh
+cd /opt/minecontext-sync
+C="docker compose -f docker-compose.yml -f docker-compose.prod.yml -p mcsync-prod"
+
+# 1. api を止める
+$C stop api
+# 2. DB を作り直す（sync を DROP して CREATE）
+$C exec -T db psql -U sync -d postgres \
+  -c "DROP DATABASE sync;" -c "CREATE DATABASE sync OWNER sync;"
+# 3. リストア（vector / pg_trgm 拡張もダンプから作成される）
+$C exec -T db pg_restore -U sync --no-owner -d sync \
+  < /opt/minecontext-sync/backups/mcsync-XXXXXXXX-HHMM.dump
+# 4. api を戻して確認
+$C start api
+curl http://127.0.0.1:18740/healthz   # {"ok":true,"db":"ok"}
+```
+
+ボリューム `mcsync-prod-pgdata` ごと消えた場合は `$C up -d db` で空の DB を初期化してから 3 を行う。
+pgdata ボリュームの tar 退避（`down -v` 前の全退避）は代替手段として使える:
 `docker run --rm -v mcsync-prod-pgdata:/data -v /root:/backup alpine \
   tar czf /backup/minecontext-sync-$(date +%F).tar.gz -C /data .`
-（pgdata ボリュームのスナップショット退避。`down -v` 前に必ず取る。）
 
 ## Lab（tailnet 内 Linux）への移行手順 — 未実施
 
