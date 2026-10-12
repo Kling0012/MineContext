@@ -51,9 +51,22 @@
             <button class="btn icon" id="next-day" aria-label="次の日">›</button>
           </div>
 
-          <div class="card">
-            <div class="strip" id="strip" aria-label="1日の作業の帯"></div>
-            <div class="strip-scale"><span>0</span><span>6</span><span>12</span><span>18</span><span>24</span></div>
+          <div class="card lanes-card">
+            <div class="lanes-head">
+              <h2>タイムライン</h2>
+              <div class="zoom">
+                <button class="btn icon small" id="zoom-out" aria-label="縮小">−</button>
+                <button class="btn small ghost" id="zoom-now">今</button>
+                <button class="btn icon small" id="zoom-in" aria-label="拡大">＋</button>
+              </div>
+            </div>
+            <div class="lanes" id="lanes">
+              <div class="lane-labels" id="lane-labels"></div>
+              <div class="lane-scroll" id="lane-scroll">
+                <div class="lane-canvas" id="lane-canvas"></div>
+              </div>
+            </div>
+            <div class="lane-pop" id="lane-pop" hidden></div>
           </div>
 
           <div class="filters" id="filters">
@@ -68,6 +81,20 @@
         </div>
 
         <aside class="col-side">
+          <div class="card heat-card">
+            <div class="lanes-head">
+              <h2 id="heat-title">この1か月</h2>
+              <div class="seg-switch" id="heat-metric">
+                <button class="on" data-m="active_minutes">自分</button>
+                <button data-m="ai_active_minutes">AI</button>
+                <button data-m="session_minutes">作業時間</button>
+              </div>
+            </div>
+            <div class="heat-week"><span>月</span><span>火</span><span>水</span><span>木</span><span>金</span><span>土</span><span>日</span></div>
+            <div class="heat" id="heat"></div>
+            <div class="heat-legend"><span>少</span><i class="l0"></i><i class="l1"></i><i class="l2"></i><i class="l3"></i><i class="l4"></i><span>多</span></div>
+            <p class="hint" id="heat-note"></p>
+          </div>
           <div class="card">
             <h2>作業時間</h2>
             <div class="total" id="total">0分</div>

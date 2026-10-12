@@ -180,29 +180,180 @@ async function loadTimeline() {
   renderTimeline();
 }
 
-function renderStrip(items) {
-  const strip = $("strip");
-  strip.replaceChildren();
-  const dayStart = new Date(`${state.day}T00:00:00+09:00`).getTime();
-  const span = 24 * 3600 * 1000;
-  const pos = (iso) => Math.min(100, Math.max(0, ((new Date(iso).getTime() - dayStart) / span) * 100));
-  for (const it of items) {
-    const g = itemGroup(it);
-    if (g === "session") {
-      const s = it.session;
-      const end = s.ended_at || (s.status === "active" ? new Date().toISOString() : s.started_at);
-      const left = pos(s.started_at);
-      strip.append(el("div", {
-        class: `seg${s.confirmed || s.status === "active" ? "" : " unconfirmed"}`,
-        style: `left:${left}%;width:${Math.max(0.4, pos(end) - left)}%`,
-        title: `${s.title}（${fmtTime(s.started_at)}〜${s.ended_at ? fmtTime(s.ended_at) : "作業中"}）`,
-      }));
-    } else {
-      strip.append(el("div", { class: `tick ${g}`, style: `left:${pos(it.t)}%` }));
-    }
-  }
-  if (state.day === todayStr()) strip.append(el("div", { class: "now", style: `left:${pos(new Date().toISOString())}%` }));
+// ---------- 横スクロールのタイムライン ----------
+const ZOOMS = [30, 45, 60, 90, 120, 180, 240, 360]; // 1 時間あたりの px
+let zoomIdx = Number(localStorage.getItem("mc.zoom") ?? 3);
+let lanesScrolledFor = null;
+
+function laneKey(it) {
+  if (it.type === "session") return { key: "session", label: "作業", color: "var(--k-session)", order: 0 };
+  const ev = it.event;
+  const name = ev.device_name || ev.device_id;
+  if (ev.kind === "ai_work") return { key: `ai:${ev.device_id}`, label: `AI ${name}`, color: "var(--k-ai)", order: 2 };
+  return { key: `dev:${ev.device_id}`, label: name, color: "var(--k-mine)", order: 1 };
 }
+
+function renderLanes(items) {
+  const pxh = ZOOMS[zoomIdx];
+  const width = pxh * 24;
+  const dayStart = new Date(`${state.day}T00:00:00+09:00`).getTime();
+  const x = (iso) => Math.min(width, Math.max(0, ((new Date(iso).getTime() - dayStart) / 3600000) * pxh));
+
+  const lanes = new Map([["session", { label: "作業", color: "var(--k-session)", order: 0, items: [] }]]);
+  for (const it of items) {
+    const k = laneKey(it);
+    if (!lanes.has(k.key)) lanes.set(k.key, { ...k, items: [] });
+    lanes.get(k.key).items.push(it);
+  }
+  const ordered = [...lanes.values()].sort((a, b) => a.order - b.order || a.label.localeCompare(b.label));
+
+  const labels = $("lane-labels");
+  labels.replaceChildren(el("div", { class: "axis-gap" }),
+    ...ordered.map((l) => el("div", { class: "lab", title: l.label }, el("span", { class: "sw", style: `background:${l.color}` }), l.label)));
+
+  const canvas = $("lane-canvas");
+  canvas.style.width = `${width}px`;
+  const axis = el("div", { class: "axis" });
+  const step = pxh >= 60 ? 1 : 2;
+  for (let h = 0; h <= 24; h += step) axis.append(el("span", { style: `left:${h * pxh}px` }, `${h}:00`));
+  const rows = ordered.map((l) => {
+    const row = el("div", { class: "row-bg" });
+    for (const it of l.items) row.append(laneMark(it, x));
+    return row;
+  });
+  const grid = [];
+  for (let h = 0; h <= 24; h++) grid.push(el("div", { class: "grid", style: `left:${h * pxh}px` }));
+  if (pxh >= 120) for (let h = 0; h < 24; h++) grid.push(el("div", { class: "grid half", style: `left:${(h + 0.5) * pxh}px` }));
+  const nowEl = state.day === todayStr() ? el("div", { class: "now", style: `left:${x(new Date().toISOString())}px` }) : null;
+  canvas.replaceChildren(...grid, axis, ...rows, nowEl);
+
+  // 初回だけ、今（今日）か最初の記録の位置へスクロール
+  if (lanesScrolledFor !== state.day) {
+    lanesScrolledFor = state.day;
+    scrollLanesTo(state.day === todayStr() ? new Date().toISOString() : items[0]?.t, x);
+  }
+}
+
+function scrollLanesTo(iso, x) {
+  const sc = $("lane-scroll");
+  if (!iso) { sc.scrollLeft = 0; return; }
+  sc.scrollLeft = Math.max(0, x(iso) - sc.clientWidth * 0.7);
+}
+
+function laneMark(it, x) {
+  if (it.type === "session") {
+    const s = it.session;
+    const end = s.ended_at || (s.status === "active" ? new Date().toISOString() : s.started_at);
+    const left = x(s.started_at);
+    const cls = ["blk", s.status === "active" ? "live" : "", !s.confirmed && s.status === "ended" ? "unconfirmed" : ""].join(" ");
+    return el("div", { class: cls, style: `left:${left}px;width:${Math.max(4, x(end) - left)}px`, onclick: () => showPop(it) }, s.title);
+  }
+  const ev = it.event;
+  if (ev.ended_at && new Date(ev.ended_at) > new Date(ev.started_at)) {
+    const left = x(ev.started_at);
+    return el("div", { class: "bar", style: `left:${left}px;width:${Math.max(6, x(ev.ended_at) - left)}px`, onclick: () => showPop(it) });
+  }
+  return el("div", { class: `dot ${ev.kind === "ai_work" ? "ai_work" : ""}`, style: `left:${x(ev.started_at)}px`, onclick: () => showPop(it) });
+}
+
+function showPop(it) {
+  const pop = $("lane-pop");
+  if (it.type === "session") {
+    const s = it.session;
+    pop.replaceChildren(
+      el("div", { class: "t" }, s.title),
+      el("div", { class: "s" }, `${fmtTime(s.started_at)}〜${s.ended_at ? fmtTime(s.ended_at) : "作業中"}${s.duration_minutes != null ? ` · ${fmtMinutes(s.duration_minutes)}` : ""}`),
+      s.note ? el("div", { class: "b" }, s.note) : null,
+    );
+  } else {
+    const ev = it.event;
+    pop.replaceChildren(
+      el("div", { class: "t" }, ev.title || ev.app || KIND_LABEL[ev.kind] || ev.kind),
+      el("div", { class: "s" }, `${fmtTime(ev.started_at)} · ${ev.device_name || ev.device_id} · ${KIND_LABEL[ev.kind] || ev.kind}`),
+      el("div", { class: "b" }, ev.text),
+    );
+  }
+  pop.hidden = false;
+}
+
+function setZoom(delta) {
+  const sc = $("lane-scroll");
+  const center = (sc.scrollLeft + sc.clientWidth / 2) / ZOOMS[zoomIdx]; // 中央の時刻（時間）
+  zoomIdx = Math.min(ZOOMS.length - 1, Math.max(0, zoomIdx + delta));
+  localStorage.setItem("mc.zoom", String(zoomIdx));
+  renderLanes(state.timeline?.items || []);
+  sc.scrollLeft = Math.max(0, center * ZOOMS[zoomIdx] - sc.clientWidth / 2);
+}
+$("zoom-in").addEventListener("click", () => setZoom(1));
+$("zoom-out").addEventListener("click", () => setZoom(-1));
+$("zoom-now").addEventListener("click", () => {
+  if (state.day !== todayStr()) { state.day = todayStr(); loadTimeline(); return; }
+  const pxh = ZOOMS[zoomIdx];
+  const dayStart = new Date(`${state.day}T00:00:00+09:00`).getTime();
+  scrollLanesTo(new Date().toISOString(), (iso) => ((new Date(iso).getTime() - dayStart) / 3600000) * pxh);
+});
+
+// ---------- 1か月のヒートマップ ----------
+let heatMetric = localStorage.getItem("mc.heat") || "active_minutes";
+let heatData = null;
+const HEAT_UNIT = { active_minutes: "分動いた", ai_active_minutes: "分 AI が動いた", session_minutes: "分の作業" };
+
+async function loadHeat() {
+  const to = todayStr();
+  const from = shiftDay(to, -34);
+  try {
+    const j = await api(`/v1/stats/daily?from=${from}&to=${to}&tz=${encodeURIComponent(TZ)}`);
+    heatData = j.days;
+    $("heat-note").textContent = "";
+  } catch {
+    heatData = null;
+    $("heat-note").textContent = "集計を読み込めませんでした。";
+  }
+  renderHeat();
+}
+
+function renderHeat() {
+  for (const b of $("heat-metric").children) b.classList.toggle("on", b.dataset.m === heatMetric);
+  const box = $("heat");
+  box.replaceChildren();
+  if (!heatData) return;
+  const today = todayStr();
+  // 直近 5 週（月曜はじまり）
+  const dow = (day) => (new Date(`${day}T12:00:00+09:00`).getUTCDay() + 6) % 7;
+  const end = shiftDay(today, 6 - dow(today));
+  const start = shiftDay(end, -34);
+  const byDate = new Map(heatData.map((d) => [d.date, d]));
+  const vals = heatData.map((d) => d[heatMetric] || 0).filter((v) => v > 0).sort((a, b) => a - b);
+  const q = (p) => vals.length ? vals[Math.min(vals.length - 1, Math.floor(p * vals.length))] : Infinity;
+  const th = [q(0.25), q(0.5), q(0.75)];
+  const level = (v) => (!v ? 0 : v <= th[0] ? 1 : v <= th[1] ? 2 : v <= th[2] ? 3 : 4);
+  let total = 0;
+  for (let i = 0; i < 35; i++) {
+    const day = shiftDay(start, i);
+    const d = byDate.get(day);
+    const v = d ? Math.round(d[heatMetric] || 0) : 0;
+    if (day <= today) total += v;
+    const future = day > today;
+    const lv = future ? 0 : level(v);
+    const cls = ["c", `l${lv}`, day === today ? "today" : "", day === state.day ? "sel" : "", future ? "future" : ""].join(" ");
+    const label = `${Number(day.slice(5, 7))}/${Number(day.slice(8))}`;
+    box.append(el("button", {
+      class: cls,
+      title: `${label}：${v}${HEAT_UNIT[heatMetric]}`,
+      "aria-label": `${label} ${v}${HEAT_UNIT[heatMetric]}`,
+      disabled: future,
+      onclick: () => { state.day = day; loadTimeline(); renderHeat(); window.scrollTo({ top: 0, behavior: "smooth" }); },
+    }, el("span", { class: "n" }, String(Number(day.slice(8))))));
+  }
+  $("heat-title").textContent = `この1か月 · ${fmtMinutes(total)}`;
+}
+$("heat-metric").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  heatMetric = b.dataset.m;
+  localStorage.setItem("mc.heat", heatMetric);
+  renderHeat();
+});
 
 function sessionItem(s) {
   const reason = s.status === "active" ? el("span", { class: "badge live" }, "作業中")
@@ -248,7 +399,9 @@ function eventItem(ev, extra) {
 function renderTimeline() {
   const tl = state.timeline;
   const items = tl.items || [];
-  renderStrip(items);
+  renderLanes(items);
+  $("lane-pop").hidden = true;
+  if (heatData) renderHeat();
   const shown = items.filter((it) => state.filter === "all" || itemGroup(it) === state.filter);
   const list = $("timeline");
   list.replaceChildren();
@@ -424,7 +577,7 @@ document.querySelector(".tabbar").addEventListener("click", (e) => {
 });
 
 async function refreshToday() {
-  await Promise.all([loadActive(), loadTimeline()]);
+  await Promise.all([loadActive(), loadTimeline(), loadHeat()]);
 }
 
 // 起動
