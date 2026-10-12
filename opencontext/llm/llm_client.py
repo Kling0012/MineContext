@@ -11,7 +11,6 @@ from enum import Enum
 from typing import Any, Dict, List
 
 from openai import APIError, AsyncOpenAI, OpenAI
-from volcenginesdkarkruntime import Ark
 
 from opencontext.models.context import Vectorize
 from opencontext.monitoring import record_processing_stage
@@ -46,6 +45,21 @@ class LLMClient:
             api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
         )
         if self.provider == LLMProvider.DOUBAO.value and self.llm_type == LLMType.EMBEDDING:
+            # Doubao multimodal embeddings need the Volcengine Ark SDK. Import it
+            # lazily so the rest of the backend works without the optional "ark"
+            # extra (fail-soft: only this client becomes unavailable).
+            try:
+                from volcenginesdkarkruntime import Ark
+            except ImportError as e:
+                logger.error(
+                    "Doubao embedding requires the optional Ark SDK "
+                    "(install with: uv sync --extra ark). "
+                    f"Doubao embedding is disabled: {e}"
+                )
+                raise ValueError(
+                    "Doubao embedding requires the optional dependency "
+                    "'volcengine-python-sdk[ark]' (uv sync --extra ark)"
+                ) from e
             self.client = Ark(api_key=self.api_key, base_url=self.base_url, timeout=self.timeout)
             self.async_client = None
 

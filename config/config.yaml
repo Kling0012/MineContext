@@ -211,7 +211,7 @@ api_auth:
 
 # Prompts configuration
 prompts:
-  language: "zh"
+  language: "en"
 
 # Content generation service configuration
 content_generation:

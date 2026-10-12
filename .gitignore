@@ -15,7 +15,6 @@ __pycache__
 .DS_Store
 
 .venv/
-uv.lock
 uv.toml
 .idea
 
