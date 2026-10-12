@@ -88,3 +88,6 @@ REPORT_AUTO_ENABLED = _bool("REPORT_AUTO_ENABLED", True)
 BLOG_AUTO = os.environ.get("BLOG_AUTO", "draft").strip().lower() or "draft"
 if BLOG_AUTO not in ("off", "draft", "publish"):
     BLOG_AUTO = "draft"
+
+# MCP (/mcp) Host header allow-list; empty = no DNS-rebinding check (tailnet-only).
+MCP_ALLOWED_HOSTS = [h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]

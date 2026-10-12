@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import or_, select
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from . import blog, config
 from .db import SessionLocal
@@ -30,6 +31,15 @@ mcp = FastMCP(
     name="hibi",
     stateless_http=True,  # each JSON-RPC request stands alone (no session)
     json_response=True,  # plain JSON responses (no SSE) keeps curl/e2e simple
+    # The SDK only allows localhost Host headers by default, which rejects
+    # clients reaching the server by its tailnet IP / name (421). The whole API
+    # is tailnet-only without auth, so the check is off unless MCP_ALLOWED_HOSTS
+    # lists hosts ("host:port" or "host:*", comma separated).
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=bool(config.MCP_ALLOWED_HOSTS),
+        allowed_hosts=config.MCP_ALLOWED_HOSTS,
+        allowed_origins=[f"http://{h}" for h in config.MCP_ALLOWED_HOSTS],
+    ),
 )
 
 _READ_NOTE = "（読み取り専用: 何も変更しない）"
