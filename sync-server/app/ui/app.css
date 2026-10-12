@@ -240,3 +240,20 @@ dialog label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); ma
 .heat .c.l2, .heat-legend .l2 { background: var(--h2); }
 .heat .c.l3, .heat-legend .l3 { background: var(--h3); }
 .heat .c.l4, .heat-legend .l4 { background: var(--h4); }
+
+/* 日報 */
+.report-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-bottom: 10px; margin-bottom: 4px; border-bottom: 1px solid var(--line); }
+.report-bar .sub { font-size: 12px; color: var(--muted); }
+.md { font-size: 15px; line-height: 1.75; word-break: break-word; }
+.md h1 { font-size: 20px; margin: 10px 0 4px; }
+.md h2 { font-size: 16px; color: var(--text); margin: 22px 0 6px; padding-left: 10px; border-left: 4px solid var(--accent); }
+.md h3 { font-size: 15px; margin: 16px 0 4px; }
+.md p { margin: 6px 0; }
+.md ul, .md ol { margin: 6px 0; padding-left: 1.3em; }
+.md li { margin: 3px 0; }
+.md code { font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 0 4px; }
+.md .tbl { overflow-x: auto; margin: 8px 0; }
+.md table { border-collapse: collapse; font-size: 14px; min-width: 100%; }
+.md th, .md td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
+.md th { background: var(--bg); font-weight: 600; }
+.md .ts { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }

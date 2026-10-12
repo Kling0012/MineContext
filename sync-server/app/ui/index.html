@@ -108,6 +108,22 @@
       </div>
     </section>
 
+    <!-- 日報 -->
+    <section class="view" id="view-report" data-view="report" hidden>
+      <div class="daynav">
+        <button class="btn icon" id="r-prev" aria-label="前の日">‹</button>
+        <button class="daylabel" id="r-daylabel"></button>
+        <button class="btn icon" id="r-next" aria-label="次の日">›</button>
+      </div>
+      <div class="card report-card">
+        <div class="report-bar">
+          <span class="sub" id="r-meta"></span>
+          <button class="btn small" id="r-generate">作成</button>
+        </div>
+        <article class="md" id="r-body"></article>
+      </div>
+    </section>
+
     <!-- 検索 -->
     <section class="view" id="view-search" data-view="search" hidden>
       <form class="card search-form" id="search-form" autocomplete="off">
@@ -144,6 +160,7 @@
 
   <nav class="tabbar">
     <button class="tab on" data-tab="today"><svg class="ti" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Zm0 4v5l3 2"/></svg>今日</button>
+    <button class="tab" data-tab="report"><svg class="ti" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h7l4 4v14H7zM14 3v4h4M10 12h5M10 16h5"/></svg>日報</button>
     <button class="tab" data-tab="search"><svg class="ti" viewBox="0 0 24 24" aria-hidden="true"><path d="M10.5 4a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13Zm4.6 11.1L20 20"/></svg>検索</button>
     <button class="tab" data-tab="status"><svg class="ti" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg>状態</button>
   </nav>
