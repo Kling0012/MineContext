@@ -34,6 +34,7 @@ curl -s http://127.0.0.1:18741/healthz
 | `EMBED_CF_ENV_FILE` | 空 | `cloudflare` 用。`CLOUDFLARE_ACCOUNT_ID`/`CLOUDFLARE_API_TOKEN` を含む env 形式ファイルのパス |
 | `EMBED_CF_TIMEOUT_SEC` | `60` | `cloudflare` 通信のタイムアウト秒 |
 | `EMBED_BATCH` | `64` | 1回の埋め込みリクエストに載せるイベント数の上限 |
+| `EMBED_RELAY_MAX_INPUTS` | `64` | `POST /v1/embeddings`（中継）の1リクエストあたり入力数上限 |
 | `EMBED_INTERVAL_SEC` | `5` | バックグラウンド埋め込みの周期 |
 | `TZ_DEFAULT` | `Asia/Tokyo` | `GET /v1/days/{date}`・`GET /v1/timeline`・`GET /v1/stats/daily` の tz 既定値 |
 | `LLM_PROVIDER` | `openai_compat` | 作業終了判定の LLM。`openai_compat`（`/chat/completions`）または `fake`（開発用・決定的・外部通信なし） |
@@ -181,6 +182,13 @@ curl -s -X POST $B/v1/search -H 'Content-Type: application/json' -d '{
   "kinds":["note","report"], "device_ids":["mac-1"], "k":20
 }'
 
+# OpenAI 互換の埋め込み中継（PC クライアント向け）。中身は上と同じ EMBED_PROVIDER。
+# model は無視されサーバ側の EMBED_MODEL を使う。input_type は互換性のためだけに
+# 受け付け、結果は変わらない（前置きなし）。失敗は 502。認証なし（tailnet 内限定）。
+curl -s -X POST $B/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3-embedding-0.6b","input":["1件目","2件目"]}' | jq '.model, [.data[].index], (.data[0].embedding | length)'
+# -> "fake-embed"（開発）/ "@cf/qwen/qwen3-embedding-0.6b"（本番）, [0,1], 1024
+
 # 削除（単体のみ）
 curl -s -X DELETE $B/v1/events/0192a0c0-0000-7000-8000-000000000001
 
@@ -274,8 +282,10 @@ GET/一覧・404）、→ LLM 到達不能時の生成は 502 でサーバは継
 失敗時保存なし）、→ ブログ blog（fake: summary/learning の uuid5 id・slug・
 材料件数・learning は type=solution の ai_work から1本・材料が無ければ 0 本・
 冪等・force（summary 同一 id・learning 入替）・一覧（新しい順・type/tag/q
-フィルタ・cursor）・全文と前後の記事・タグ別件数・404）、を curl+jq で検証し
-PASS/FAIL を出す。
+フィルタ・cursor）・全文と前後の記事・タグ別件数・404）、→ OpenAI 互換
+`/v1/embeddings` 中継（単発・複数・入力順・次元=EMBED_DIM・決定性・64 件まで・
+65 件で 422・空入力 422・不正 input_type 422・埋め込み到達不能時 502）、
+を curl+jq で検証し PASS/FAIL を出す。
 終了時に `compose down -v` で環境を消す。
 
 `fake` provider はテキストの単語・文字2-gram を特徴ハッシュした決定的ベクトルで、
@@ -296,6 +306,21 @@ graphiti `graphiti_core/embedder/openai.py` の `create`/`create_batch`）。
 アカウント ID とトークンは env 形式ファイル（`EMBED_CF_ENV_FILE`）から読み、
 環境変数・コマンドラインには載せない。失敗時は既存の fail-soft
 （events の保存・trgm 検索は止まらず、次周期で再試行）。
+
+## OpenAI 互換埋め込み中継 `/v1/embeddings`（P1-C）
+
+PC（Mac/Windows）の MineContext は埋め込みをこのサーバ経由で使う
+（provider id `mcsync_embedding`、kind `openai_compat`、
+`base_url: ${MINECONTEXT_SYNC_URL:http://<sync-server-ip>:18740}/v1`、
+次元 1024）。PC に Cloudflare の秘密を配らずに済み、同期サーバと
+記憶システム（agent-memory）で同じモデル・同じ空間になる。
+リクエストは OpenAI 形式 `{model, input: str|list[str], input_type?}`
+（`input_type` は `"query"`|`"document"`。互換性のためだけに受け付け、
+結果は変わらない）、1 リクエスト最大 `EMBED_RELAY_MAX_INPUTS` 件。
+レスポンスは `{object:"list", data:[{index, embedding}], model, usage}`。
+`model` はサーバ側の `EMBED_MODEL` を返す（リクエストの model 名は無視）。
+プロバイダ失敗時は 502（呼び出し側が fail-soft で扱う）。認証なし
+（他の API と同じく tailnet 内限定）。usage のトークン数は文字数の近似。
 
 ## 本番配置（<sync-host>）
 

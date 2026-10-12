@@ -33,6 +33,8 @@ EMBED_CF_TIMEOUT_SEC = _float("EMBED_CF_TIMEOUT_SEC", 60.0)
 EMBED_DIM = _int("EMBED_DIM", 1024)
 EMBED_INTERVAL_SEC = _int("EMBED_INTERVAL_SEC", 5)
 EMBED_BATCH = _int("EMBED_BATCH", 64)
+# OpenAI-compatible /v1/embeddings relay (P1-C): max inputs per request.
+EMBED_RELAY_MAX_INPUTS = _int("EMBED_RELAY_MAX_INPUTS", 64)
 TZ_DEFAULT = os.environ.get("TZ_DEFAULT", "Asia/Tokyo")
 BIND_HOST = os.environ.get("BIND_HOST", "0.0.0.0")
 BIND_PORT = _int("BIND_PORT", 8000)

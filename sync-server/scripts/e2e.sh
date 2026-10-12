@@ -237,6 +237,9 @@ for i in $(seq 1 60); do
   sleep 1
 done
 echo "$HZ" | jq -e '.ok == true' >/dev/null 2>&1 && ok "healthz ok with failing embedder" || bad "healthz with failing embedder: $HZ"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/embeddings" \
+  -H 'Content-Type: application/json' -d '{"model":"m","input":"relay test"}')
+check "$CODE" "502" "embeddings relay reports 502 while embedder unreachable"
 E5=$(uuid)
 R=$(req POST "/v1/events:batch" "{\"device_id\":\"win-1\",\"events\":[$(mk $E5 win-1 note "${DAY}T12:00:00+09:00" '障害時でも登録できるメモ' 'resilient note')]}")
 check "$(echo "$R" | jq -r .accepted)" "1" "ingest works while embedder fails"
@@ -531,6 +534,33 @@ check "$CODE" "404" "unknown slug -> 404"
 TG=$(req GET "/v1/blog/tags")
 check "$(echo "$TG" | jq -r '.[] | select(.tag=="fake") | .count')" "3" "tag counts (fake on all posts)"
 check "$(echo "$TG" | jq -r '.[] | select(.tag=="e2e") | .count')" "1" "tag counts (e2e on learning)"
+
+echo "=== 20. OpenAI-compatible /v1/embeddings relay (fake provider)"
+EM=$(req POST /v1/embeddings '{"model":"qwen3-embedding-0.6b","input":"四半期財務レポート"}')
+check "$(echo "$EM" | jq -r .object)" "list" "embeddings: object=list"
+check "$(echo "$EM" | jq '.data | length')" "1" "embeddings: single string -> 1 vector"
+check "$(echo "$EM" | jq -r .data[0].index)" "0" "embeddings: index 0"
+check "$(echo "$EM" | jq '.data[0].embedding | length')" "1024" "embeddings: vector is EMBED_DIM (1024)"
+check "$(echo "$EM" | jq -r .model)" "fake-embed" "embeddings: echoes server EMBED_MODEL (request model ignored)"
+check "$(echo "$EM" | jq '.usage.prompt_tokens >= 1')" "true" "embeddings: usage present"
+V1=$(echo "$EM" | jq -c .data[0].embedding)
+EM2=$(req POST /v1/embeddings '{"model":"m","input":["四半期財務レポート","english text"],"input_type":"query"}')
+check "$(echo "$EM2" | jq -r '[.data[].index] | join(",")')" "0,1" "embeddings: batch keeps input order (indexes)"
+check "$(echo "$EM2" | jq -c .data[0].embedding)" "$V1" "embeddings: same text -> same vector (deterministic)"
+check "$(echo "$EM2" | jq -c '.data[0].embedding != .data[1].embedding')" "true" "embeddings: different texts differ"
+IN64=$(python3 -c "print(','.join(['\"x\"']*64))")
+IN65=$(python3 -c "print(','.join(['\"x\"']*65))")
+EM64=$(req POST /v1/embeddings "{\"model\":\"m\",\"input\":[$IN64]}")
+check "$(echo "$EM64" | jq '.data | length')" "64" "embeddings: 64 inputs accepted (max)"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/embeddings" \
+  -H 'Content-Type: application/json' -d "{\"model\":\"m\",\"input\":[$IN65]}")
+check "$CODE" "422" "embeddings: 65 inputs -> 422"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/embeddings" \
+  -H 'Content-Type: application/json' -d '{"model":"m","input":""}')
+check "$CODE" "422" "embeddings: empty input -> 422"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/embeddings" \
+  -H 'Content-Type: application/json' -d '{"model":"m","input":"x","input_type":"bogus"}')
+check "$CODE" "422" "embeddings: bad input_type -> 422"
 
 echo
 echo "results: PASS=$PASS FAIL=$FAIL"

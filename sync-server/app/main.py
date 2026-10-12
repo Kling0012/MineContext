@@ -46,6 +46,10 @@ from .schemas import (
     DayCounts,
     DayResponse,
     DeviceIn,
+    EmbeddingItem,
+    EmbeddingsIn,
+    EmbeddingsOut,
+    EmbeddingsUsage,
     EventBatchIn,
     EventIn,
     EventOut,
@@ -378,6 +382,40 @@ def search(body: SearchIn, db: Session = Depends(get_db)):
             )
         )
     return SearchResponse(query=body.query, hits=hits)
+
+
+@app.post("/v1/embeddings", response_model=EmbeddingsOut)
+def post_embeddings(body: EmbeddingsIn):
+    """OpenAI-compatible embeddings relay (P1-C).
+
+    Lets PC clients (MineContext) use this server's embedding provider
+    (cloudflare in production) without holding the provider credentials.
+    Plain relay: the request's model name is ignored (the server-side
+    EMBED_MODEL is used), and input_type does not change the result (the
+    provider uses no query/document prefix, same as the agent-memory
+    gateway). Provider failures return 502; callers are expected to degrade
+    gracefully (fail-soft). No auth (tailnet-only policy, like the rest).
+    """
+    texts = [body.input] if isinstance(body.input, str) else body.input
+    if len(texts) > config.EMBED_RELAY_MAX_INPUTS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"too many inputs: {len(texts)} (max {config.EMBED_RELAY_MAX_INPUTS})",
+        )
+    try:
+        vecs = embed_sync(texts)
+    except Exception as e:  # noqa: BLE001 - relay this request's failure only
+        raise HTTPException(
+            status_code=502, detail=f"embedding provider failed: {e}"
+        ) from e
+    # Character count as a rough token estimate (real usage is not returned
+    # by the internal embed_sync interface; OpenAI clients don't rely on it).
+    chars = sum(len(t) for t in texts)
+    return EmbeddingsOut(
+        data=[EmbeddingItem(index=i, embedding=v) for i, v in enumerate(vecs)],
+        model=config.EMBED_MODEL,
+        usage=EmbeddingsUsage(prompt_tokens=chars, total_tokens=chars),
+    )
 
 
 @app.delete("/v1/events/{event_id}")

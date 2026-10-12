@@ -315,3 +315,37 @@ class BlogGenerateOut(BaseModel):
 class BlogTagOut(BaseModel):
     tag: str
     count: int
+
+
+# --- OpenAI-compatible embeddings relay (P1-C): PC clients -> this server ---
+
+
+class EmbeddingsIn(BaseModel):
+    """OpenAI-style /v1/embeddings request body.
+
+    input_type is accepted for client convenience ("query" | "document");
+    the underlying provider uses no query/document prefix (same as the
+    agent-memory gateway), so it does not change the result.
+    """
+
+    model: str = ""
+    input: str | list[str] = Field(min_length=1)
+    input_type: str = Field(default="document", pattern="^(query|document)$")
+
+
+class EmbeddingItem(BaseModel):
+    object: str = "embedding"
+    index: int
+    embedding: list[float]
+
+
+class EmbeddingsUsage(BaseModel):
+    prompt_tokens: int = 0
+    total_tokens: int = 0
+
+
+class EmbeddingsOut(BaseModel):
+    object: str = "list"
+    data: list[EmbeddingItem]
+    model: str
+    usage: EmbeddingsUsage = EmbeddingsUsage()
