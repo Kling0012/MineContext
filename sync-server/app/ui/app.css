@@ -58,6 +58,8 @@ button, input { font: inherit; color: inherit; }
   border-bottom: 1px solid var(--line);
 }
 .brand { font-weight: 700; letter-spacing: .02em; }
+.toplink { font-size: 13px; color: var(--muted); text-decoration: none; margin-left: auto; margin-right: 14px; }
+.toplink:hover { color: var(--accent); }
 .health { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
 .health .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
 .health.ok .dot { background: var(--ok); }
@@ -257,3 +259,4 @@ dialog label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); ma
 .md th, .md td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
 .md th { background: var(--bg); font-weight: 600; }
 .md .ts { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.md pre.code { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; overflow-x: auto; font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
