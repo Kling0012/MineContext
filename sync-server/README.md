@@ -35,7 +35,7 @@ curl -s http://127.0.0.1:18741/healthz
 | `EMBED_CF_TIMEOUT_SEC` | `60` | `cloudflare` 通信のタイムアウト秒 |
 | `EMBED_BATCH` | `64` | 1回の埋め込みリクエストに載せるイベント数の上限 |
 | `EMBED_INTERVAL_SEC` | `5` | バックグラウンド埋め込みの周期 |
-| `TZ_DEFAULT` | `Asia/Tokyo` | `GET /v1/days/{date}` と `GET /v1/timeline` の tz 既定値 |
+| `TZ_DEFAULT` | `Asia/Tokyo` | `GET /v1/days/{date}`・`GET /v1/timeline`・`GET /v1/stats/daily` の tz 既定値 |
 | `LLM_PROVIDER` | `openai_compat` | 作業終了判定の LLM。`openai_compat`（`/chat/completions`）または `fake`（開発用・決定的・外部通信なし） |
 | `LLM_BASE_URL` | 空 | OpenAI 互換のベース URL（`.../v1` まで）。`openai_compat` 時必須（未設定なら判定をスキップしてログのみ） |
 | `LLM_MODEL` | `glm-5.3-flash` | 終了判定に使うモデル名 |
@@ -180,6 +180,13 @@ curl -s "$B/v1/timeline?date=2026-10-12&tz=Asia/Tokyo" | \
 # supersede された ai_work（meta.superseded_by あり）は既定で隠れる。表示するには:
 curl -s "$B/v1/timeline?date=2026-10-12&tz=Asia/Tokyo&include_superseded=true"
 
+# 日別集計（ヒートマップ用）: 期間内の全日を返す（記録の無い日も 0 で）。
+# events=全件数 / mine=kind != ai_work / ai_work / active_minutes・ai_active_minutes=
+# started_at を5分刻みに丸めた異なる区間の数 x5 / session_minutes=その日に重なる
+# work_sessions（cancelled 以外）を日境界で切って合計（active は now まで）。
+# 期間は最大400日。日付の境界は tz で計算。1クエリで集計。
+curl -s "$B/v1/stats/daily?from=2026-09-13&to=2026-10-12&tz=Asia/Tokyo" | jq '.days[-1]'
+
 # agent-memory 取り込み（ai_work イベント）の状態と手動実行
 curl -s $B/v1/importers
 # -> {"importers":[{"name":"agent_memory","enabled":true,"cursor_ts":"...",
@@ -206,7 +213,8 @@ compose の e2e プロファイルサービス `--profile e2e` として起動�
 同じネットワーク内なので本物には触らない）から ai_work 取り込み（タイムライン時刻順・superseded
 既定で非表示・再実行で重複なし・active セッションへ紐付け）→ 偽サーバ停止中も
 サーバは動き続け（run は 502・last_error 記録）復帰後にバックグラウンドで再取り込み、
-を curl+jq で検証し PASS/FAIL を出す。
+→ 日別集計 stats/daily（記録の無い日が 0・tz 境界の日付・active_minutes の丸め・
+セッションの日跨ぎ分割・期間超過 422）、を curl+jq で検証し PASS/FAIL を出す。
 終了時に `compose down -v` で環境を消す。
 
 `fake` provider はテキストの単語・文字2-gram を特徴ハッシュした決定的ベクトルで、

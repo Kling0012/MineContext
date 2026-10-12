@@ -31,6 +31,8 @@ from .models import (
 from .schemas import (
     ActiveSessionOut,
     BatchResult,
+    DailyStat,
+    DailyStatsResponse,
     DayCounts,
     DayResponse,
     DeviceIn,
@@ -603,6 +605,101 @@ def get_timeline(
         session_totals=totals,
         total_minutes=round(sum(t.minutes for t in totals), 2),
     )
+
+
+# --- Daily stats (heatmap): one row per calendar day in the requested tz ---
+
+
+# One SQL: day grid (generate_series) + event aggregates + 5-min activity
+# buckets + session minutes clipped at day boundaries. All days in the range
+# are returned, including days with no records (LEFT JOIN -> zeros/NULL).
+_DAILY_STATS_SQL = sql_text(
+    """
+    WITH day_list AS (
+        -- pure calendar arithmetic (date + int): no session-TZ involvement
+        SELECT (CAST(:from_d AS date) + n)::date AS d
+        FROM generate_series(0, CAST(:to_d AS date) - CAST(:from_d AS date)) AS g(n)
+    ),
+    bounds AS (
+        SELECT d,
+               timezone(:tz, d::timestamp) AS s,
+               timezone(:tz, (d + 1)::timestamp) AS e
+        FROM day_list
+    ),
+    evday AS (
+        SELECT b.d, e.kind, e.started_at,
+               floor(extract(epoch FROM e.started_at) / 300) AS bucket
+        FROM events e
+        JOIN bounds b ON e.started_at >= b.s AND e.started_at < b.e
+        WHERE e.started_at >= (SELECT min(s) FROM bounds)
+          AND e.started_at <  (SELECT max(e) FROM bounds)
+    ),
+    evagg AS (
+        SELECT d,
+               count(*) AS events,
+               count(*) FILTER (WHERE kind <> 'ai_work') AS mine,
+               count(*) FILTER (WHERE kind = 'ai_work') AS ai_work,
+               min(started_at) AS first_at,
+               max(started_at) AS last_at
+        FROM evday GROUP BY d
+    ),
+    buck AS (
+        SELECT d,
+               count(DISTINCT bucket) FILTER (WHERE kind <> 'ai_work') AS active_b,
+               count(DISTINCT bucket) FILTER (WHERE kind = 'ai_work') AS ai_b
+        FROM evday GROUP BY d
+    ),
+    sess AS (
+        SELECT b.d,
+               sum(greatest(0.0, extract(epoch FROM
+                   (least(coalesce(ws.ended_at, now()), b.e)
+                    - greatest(ws.started_at, b.s))) / 60.0)) AS minutes
+        FROM work_sessions ws
+        JOIN bounds b
+          ON ws.started_at < b.e
+         AND coalesce(ws.ended_at, now()) > b.s
+         AND ws.status <> 'cancelled'
+        GROUP BY b.d
+    )
+    SELECT to_char(b.d, 'YYYY-MM-DD') AS date,
+           coalesce(a.events, 0) AS events,
+           coalesce(a.mine, 0) AS mine,
+           coalesce(a.ai_work, 0) AS ai_work,
+           coalesce(k.active_b, 0) * 5 AS active_minutes,
+           coalesce(k.ai_b, 0) * 5 AS ai_active_minutes,
+           round(coalesce(s.minutes, 0.0), 2)::float8 AS session_minutes,
+           a.first_at, a.last_at
+    FROM bounds b
+    LEFT JOIN evagg a ON a.d = b.d
+    LEFT JOIN buck k ON k.d = b.d
+    LEFT JOIN sess s ON s.d = b.d
+    ORDER BY b.d
+    """
+)
+
+
+@app.get("/v1/stats/daily", response_model=DailyStatsResponse)
+def get_daily_stats(
+    from_: date = Query(alias="from"),
+    to: date = Query(...),
+    tz: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    tz_name = tz or config.TZ_DEFAULT
+    try:
+        ZoneInfo(tz_name)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"unknown tz: {tz_name}") from e
+    n_days = (to - from_).days + 1
+    if n_days < 1:
+        raise HTTPException(status_code=422, detail="from must be <= to")
+    if n_days > 400:
+        raise HTTPException(status_code=422, detail="range too large (max 400 days)")
+    rows = db.execute(
+        _DAILY_STATS_SQL, {"tz": tz_name, "from_d": from_, "to_d": to}
+    ).mappings().fetchall()
+    days = [DailyStat.model_validate(r) for r in rows]
+    return DailyStatsResponse(tz=tz_name, days=days)
 
 
 # --- Importers (P3-A): agent-memory records -> ai_work events ---

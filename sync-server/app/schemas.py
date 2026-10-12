@@ -179,6 +179,28 @@ class TimelineResponse(BaseModel):
     total_minutes: float
 
 
+class DailyStat(BaseModel):
+    """One calendar day (in the requested tz) for GET /v1/stats/daily."""
+
+    date: str
+    events: int  # all kinds
+    mine: int  # kind != ai_work
+    ai_work: int
+    # distinct 5-min buckets of started_at x 5
+    active_minutes: int  # kind != ai_work
+    ai_active_minutes: int  # same for ai_work
+    # work_sessions (cancelled excluded) overlapping the day, clipped at
+    # day boundaries; active sessions count up to now
+    session_minutes: float
+    first_at: datetime | None
+    last_at: datetime | None
+
+
+class DailyStatsResponse(BaseModel):
+    tz: str
+    days: list[DailyStat]
+
+
 class ImporterOut(BaseModel):
     name: str
     enabled: bool = False

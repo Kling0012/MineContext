@@ -182,7 +182,10 @@ check "$(echo "$S2R" | jq -r .end_reason)" "superseded" "end_reason=superseded"
 check "$(echo "$S2R" | jq -r .ended_at)" "$(echo "$S3" | jq -r .session.started_at)" "superseded ended_at = new started_at"
 A=$(req GET /v1/sessions/active | jq -r .session.id)
 check "$A" "$SID3" "newest declaration is the active session"
-RL=$(uuid); RLT=$(date -u -d '+1 seconds' +%Y-%m-%dT%H:%M:%SZ)
+RL=$(uuid); RLT=$(date -u -d '+5 seconds' +%Y-%m-%dT%H:%M:%SZ)
+# +5s: keeps RL strictly later than section 11's U3 (+3s there), so the
+# judge's "last event" (idle evidence / ended_at) is always RL regardless
+# of how fast the intermediate poll loops finish.
 R=$(req POST "/v1/events:batch" "{\"device_id\":\"mac-1\",\"events\":[$(mk $RL mac-1 activity "$RLT" '資料読み:設計書の章を読み進めた' 'reading')]}")
 LNK=$(req GET "/v1/events?device_id=mac-1&kind=activity&limit=50" | jq -r ".events[] | select(.id==\"$RL\") | .session_id")
 check "$LNK" "$SID3" "event links to the new active session"
@@ -351,6 +354,43 @@ check "$EVC3" "5" "background import recovers after agent-memory returns"
 check "$(req GET /v1/importers | jq -r '.importers[] | select(.name=="agent_memory") | .last_success_at != null')" "true" "last_success_at set after recovery"
 AWF=$(req GET "/v1/timeline?date=${DAY}&tz=Asia/Tokyo" | jq -r '[.items[] | select(.type=="ai_work") | select(.event.device_id | startswith("agent:"))] | length')
 check "$AWF" "4" "timeline shows recovered record (superseded still hidden)"
+
+echo "=== 16. stats/daily: empty days, tz boundary, 5-min rounding, session day-split"
+D1="$(date -d '+1 day' +%F)"; D2="$(date -d '+2 day' +%F)"; D3="$(date -d '+3 day' +%F)"
+# DAY 19:00Z == DAY+1 04:00+09:00 -> belongs to DAY+1 in Asia/Tokyo, DAY in UTC
+EA=$(uuid)
+R=$(req POST "/v1/events:batch" "{\"device_id\":\"win-1\",\"events\":[$(mk $EA win-1 note "${DAY}T19:00:00Z" 'tz境界のメモ' 'tz edge')]}")
+check "$(echo "$R" | jq -r .accepted)" "1" "boundary event ingested"
+# clean day D2: 09:01/09:04 same 5-min bucket, 09:07 next bucket; ai_work both in one bucket
+B1=$(uuid); B2=$(uuid); B3=$(uuid); AI1=$(uuid); AI2=$(uuid)
+R=$(req POST "/v1/events:batch" "{\"device_id\":\"mac-1\",\"events\":[$(mk $B1 mac-1 note "${D2}T09:01:00+09:00" '丸め1' 'r1'),$(mk $B2 mac-1 note "${D2}T09:04:00+09:00" '丸め2' 'r2'),$(mk $B3 mac-1 note "${D2}T09:07:00+09:00" '丸め3' 'r3'),$(mk $AI1 mac-1 ai_work "${D2}T10:01:00+09:00" 'AI作業1' 'ai1'),$(mk $AI2 mac-1 ai_work "${D2}T10:03:00+09:00" 'AI作業2' 'ai2')]}")
+check "$(echo "$R" | jq -r .accepted)" "5" "bucket-rounding events ingested"
+# session crossing midnight JST: DAY 23:00 -> DAY+1 01:00 (60min on each day)
+SS=$(req POST /v1/sessions "{\"title\":\"日跨ぎ作業\",\"device_id\":\"mac-1\",\"started_at\":\"${DAY}T23:00:00+09:00\"}")
+SSID=$(echo "$SS" | jq -r .session.id)
+SE=$(req POST "/v1/sessions/$SSID/end" "{\"ended_at\":\"${D1}T01:00:00+09:00\"}")
+check "$(echo "$SE" | jq -r .status)" "ended" "cross-midnight session ended"
+
+ST=$(req GET "/v1/stats/daily?from=${DAY}&to=${D3}")
+check "$(echo "$ST" | jq -r .tz)" "Asia/Tokyo" "default tz is Asia/Tokyo"
+check "$(echo "$ST" | jq '.days | length')" "4" "all days in range returned (incl. empty)"
+J1=$(echo "$ST" | jq -c ".days[] | select(.date==\"$D1\")")
+check "$(echo "$J1" | jq -r '[.events,.mine,.ai_work,.active_minutes,.ai_active_minutes] | @tsv')" "1	1	0	5	0" "D1(JST): boundary event counts (mine bucket)"
+check "$(echo "$J1" | jq '.session_minutes == 60')" "true" "D1(JST): 60min session part after midnight"
+J2=$(echo "$ST" | jq -c ".days[] | select(.date==\"$D2\")")
+check "$(echo "$J2" | jq -r '[.events,.mine,.ai_work,.active_minutes,.ai_active_minutes] | @tsv')" "5	3	2	10	5" "D2(JST): 5-min bucket rounding (2 mine + 1 ai buckets)"
+check "$(echo "$J2" | jq '.session_minutes == 0')" "true" "D2(JST): no session overlap"
+check "$(echo "$J2" | jq -r .first_at)" "${D2}T00:01:00Z" "D2 first_at (09:01 JST in UTC)"
+check "$(echo "$J2" | jq -r .last_at)" "${D2}T01:03:00Z" "D2 last_at (10:03 JST in UTC)"
+J3=$(echo "$ST" | jq -c ".days[] | select(.date==\"$D3\")")
+check "$(echo "$J3" | jq -r '[.events,.mine,.ai_work,.active_minutes,.ai_active_minutes,(.session_minutes==0),(.first_at==null),(.last_at==null)] | @tsv')" "0	0	0	0	0	true	true	true" "day without records is all zeros/nulls"
+JD=$(echo "$ST" | jq -c ".days[] | select(.date==\"$DAY\")")
+check "$(echo "$JD" | jq '.session_minutes >= 60')" "true" "cross-midnight session gives DAY its 60min part"
+STU=$(req GET "/v1/stats/daily?from=${DAY}&to=${D1}&tz=UTC")
+check "$(echo "$STU" | jq -r ".days[] | select(.date==\"$D1\") | [.events,.mine] | @tsv")" "0	0" "tz=UTC: boundary event not on DAY+1"
+check "$(echo "$STU" | jq '.days[] | select(.date=="'$DAY'") | .mine >= 4')" "true" "tz=UTC: boundary event counted on DAY instead"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/stats/daily?from=${DAY}&to=$(date -d '+401 day' +%F)")
+check "$CODE" "422" "range over 400 days -> 422"
 
 echo
 echo "results: PASS=$PASS FAIL=$FAIL"
