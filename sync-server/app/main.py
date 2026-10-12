@@ -15,12 +15,13 @@ from sqlalchemy import func, or_, select, text as sql_text, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from . import am_import, config, daily_report
+from . import am_import, blog, config, daily_report
 from .db import engine, get_db
 from .embedding import embed_sync, embedding_worker, pending_count
 from .links import session_links_for_times
 from .models import (
     AUTO_LINK_KINDS,
+    BlogPost,
     Device,
     Event,
     EVENT_KINDS,
@@ -31,6 +32,15 @@ from .models import (
 from .schemas import (
     ActiveSessionOut,
     BatchResult,
+    BlogEntryOut,
+    BlogGenerateIn,
+    BlogGenerateOut,
+    BlogPostBrief,
+    BlogPostDetail,
+    BlogPostOut,
+    BlogPostRef,
+    BlogPostsPage,
+    BlogTagOut,
     DailyStat,
     DailyStatsResponse,
     DayCounts,
@@ -769,6 +779,140 @@ def list_reports(
     )
 
 
+# --- Blog (P5): auto-generated articles from the day's records ---
+
+
+@app.post("/v1/blog/generate", response_model=BlogGenerateOut)
+def post_blog_generate(body: BlogGenerateIn, db: Session = Depends(get_db)):
+    tz_name = body.tz or config.TZ_DEFAULT
+    try:
+        ZoneInfo(tz_name)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"unknown tz: {tz_name}") from e
+    types = body.types if body.types is not None else list(blog.BLOG_TYPES)
+    for t in types:
+        if t not in blog.BLOG_TYPES:
+            raise HTTPException(status_code=422, detail=f"unknown blog type: {t}")
+    try:
+        out = blog.generate_blog(db, body.date, tz_name, types, force=body.force)
+    except blog.BlogError as e:
+        # only this request fails; the server keeps running (fail-soft)
+        raise HTTPException(status_code=502, detail=f"blog generation failed: {e}") from e
+    summary = (
+        BlogEntryOut(
+            post=BlogPostOut.model_validate(out["summary"]["post"]),
+            generated=out["summary"]["generated"],
+        )
+        if out["summary"]
+        else None
+    )
+    learning = [
+        BlogEntryOut(post=BlogPostOut.model_validate(x["post"]), generated=x["generated"])
+        for x in out["learning"]
+    ]
+    return BlogGenerateOut(date=out["date"], tz=out["tz"], summary=summary, learning=learning)
+
+
+def _blog_decode_cursor(cursor: str) -> tuple[date, datetime, uuid.UUID]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode()).decode()
+        d_s, ts_s, id_s = raw.split("|", 2)
+        return date.fromisoformat(d_s), datetime.fromisoformat(ts_s), uuid.UUID(id_s)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="invalid cursor") from e
+
+
+def _blog_encode_cursor(d: date, ts: datetime, id_: uuid.UUID) -> str:
+    raw = f"{d.isoformat()}|{ts.isoformat()}|{id_}"
+    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+@app.get("/v1/blog/posts", response_model=BlogPostsPage)
+def list_blog_posts(
+    type_: str | None = Query(default=None, alias="type"),
+    tag: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    from_: date | None = Query(default=None, alias="from"),
+    to: date | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    cursor: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    if type_ is not None and type_ not in blog.BLOG_TYPES:
+        raise HTTPException(status_code=422, detail=f"unknown type: {type_}")
+    conds = []
+    if type_ is not None:
+        conds.append(BlogPost.type == type_)
+    if tag is not None:
+        conds.append(BlogPost.tags.contains([tag]))
+    if q is not None:
+        like = f"%{q}%"
+        conds.append(or_(BlogPost.title.ilike(like), BlogPost.markdown.ilike(like)))
+    if from_ is not None:
+        conds.append(BlogPost.date >= from_)
+    if to is not None:
+        conds.append(BlogPost.date <= to)
+    if cursor:
+        d, ts, id_ = _blog_decode_cursor(cursor)
+        conds.append(
+            tuple_(BlogPost.date, BlogPost.created_at, BlogPost.id) < (d, ts, id_)
+        )
+    query = (
+        select(BlogPost)
+        .where(*conds)
+        .order_by(BlogPost.date.desc(), BlogPost.created_at.desc(), BlogPost.id.desc())
+        .limit(limit)
+    )
+    posts = db.scalars(query).fetchall()
+    next_cursor = (
+        _blog_encode_cursor(posts[-1].date, posts[-1].created_at, posts[-1].id)
+        if len(posts) == limit
+        else None
+    )
+    return BlogPostsPage(
+        posts=[BlogPostBrief.model_validate(p) for p in posts], next_cursor=next_cursor
+    )
+
+
+@app.get("/v1/blog/posts/{slug}", response_model=BlogPostDetail)
+def get_blog_post(slug: str, db: Session = Depends(get_db)):
+    p = db.scalars(select(BlogPost).where(BlogPost.slug == slug)).first()
+    if p is None:
+        raise HTTPException(status_code=404, detail="post not found")
+    key = tuple_(BlogPost.date, BlogPost.created_at, BlogPost.id)
+    # chronological neighbors: prev = closest older, next = closest newer
+    prev = db.scalars(
+        select(BlogPost)
+        .where(key < (p.date, p.created_at, p.id))
+        .order_by(BlogPost.date.desc(), BlogPost.created_at.desc(), BlogPost.id.desc())
+        .limit(1)
+    ).first()
+    nxt = db.scalars(
+        select(BlogPost)
+        .where(key > (p.date, p.created_at, p.id))
+        .order_by(BlogPost.date.asc(), BlogPost.created_at.asc(), BlogPost.id.asc())
+        .limit(1)
+    ).first()
+    out = BlogPostDetail.model_validate(p)
+    out.prev = BlogPostRef(slug=prev.slug, title=prev.title) if prev else None
+    out.next = BlogPostRef(slug=nxt.slug, title=nxt.title) if nxt else None
+    return out
+
+
+_BLOG_TAGS_SQL = sql_text(
+    "SELECT t.tag AS tag, count(*) AS count "
+    "FROM blog_posts p, unnest(p.tags) AS t(tag) "
+    "GROUP BY t.tag ORDER BY count(*) DESC, t.tag"
+)
+
+
+@app.get("/v1/blog/tags", response_model=list[BlogTagOut])
+def list_blog_tags(db: Session = Depends(get_db)):
+    rows = db.execute(_BLOG_TAGS_SQL).mappings().fetchall()
+    return [BlogTagOut(tag=r["tag"], count=r["count"]) for r in rows]
+
+
 # --- Importers (P3-A): agent-memory records -> ai_work events ---
 
 
@@ -807,3 +951,9 @@ if _UI_DIR.is_dir():
     @app.get("/", include_in_schema=False)
     def _root() -> RedirectResponse:
         return RedirectResponse("/ui/")
+
+# Blog reader pages (static files built separately; mounted only when the
+# directory exists so the server runs fine without it).
+_BLOG_DIR = Path(__file__).parent / "blog"
+if _BLOG_DIR.is_dir():
+    app.mount("/blog", StaticFiles(directory=_BLOG_DIR, html=True), name="blog")

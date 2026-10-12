@@ -456,6 +456,81 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/reports/daily?date=${D2}
 check "$CODE" "404" "failed generation stores nothing"
 G=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/reports/daily?date=${DAY}")
 check "$G" "200" "existing report untouched by the failure"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/blog/generate" \
+  -H 'Content-Type: application/json' -d "{\"date\":\"${D2}\",\"force\":true}")
+check "$CODE" "502" "blog generation reports 502 while LLM unreachable"
+check "$(curl -s "$BASE/healthz" | jq -r .ok)" "true" "server stays up when blog LLM fails"
+N=$(req GET "/v1/blog/posts" | jq '.posts | length')
+check "$N" "0" "failed blog generation stores nothing"
+
+echo "=== 19. blog (fake): both types, idempotent, force, list/detail/tags"
+if ! sudo env EMBED_PROVIDER=fake LLM_PROVIDER=fake SESSION_JUDGE_INTERVAL=600 IDLE_MINUTES=15 \
+     AM_BASE_URL=http://fake-agent-memory:8377 AM_IMPORT_INTERVAL=3 \
+     docker compose -p mcsync-e2e up -d api >/dev/null 2>&1; then
+  bad "recreate api with fake providers (blog)"
+fi
+HZ=""
+for i in $(seq 1 60); do
+  HZ=$(curl -s "$BASE/healthz" || true)
+  echo "$HZ" | jq -e '.ok == true' >/dev/null 2>&1 && break
+  sleep 1
+done
+echo "$HZ" | jq -e '.ok == true' >/dev/null 2>&1 && ok "api back on fake providers (blog)" || bad "api did not come back: $HZ"
+BG=$(req POST /v1/blog/generate "{\"date\":\"${DAY}\"}")
+check "$(echo "$BG" | jq -r .summary.generated)" "true" "summary post generated (fake provider)"
+SUMID=$(python3 -c "import uuid;print(uuid.uuid5(uuid.NAMESPACE_URL,'minecontext:sync-server:blog-post:${DAY}:summary:'))")
+check "$(echo "$BG" | jq -r .summary.post.id)" "$SUMID" "summary id is uuid5(date+type+topic)"
+check "$(echo "$BG" | jq -r .summary.post.slug)" "${DAY}-summary" "summary slug"
+check "$(echo "$BG" | jq -r .summary.post.type)" "summary" "summary type"
+check "$(echo "$BG" | jq -r .summary.post.model)" "fake" "summary model=fake"
+TL=$(req GET "/v1/timeline?date=${DAY}&tz=Asia/Tokyo")
+AIW=$(echo "$TL" | jq '[.items[] | select(.type=="ai_work")] | length')
+MATS=$(echo "$TL" | jq '[.items[] | select(.type=="event" and (.event.kind=="activity" or .event.kind=="screen_summary"))] | length')
+AILINE=$(echo "$BG" | jq -r .summary.post.markdown | grep '^- ai_work: ')
+check "$AILINE" "- ai_work: $AIW" "fake summary lists material counts"
+check "$(echo "$BG" | jq '.summary.post.source_event_ids | length')" "$((AIW+MATS))" "summary source_event_ids covers material events"
+LID=$(python3 -c "import uuid;print(uuid.uuid5(uuid.NAMESPACE_URL,'minecontext:sync-server:blog-post:${DAY}:learning:t1'))")
+check "$(echo "$BG" | jq '.learning | length')" "1" "one learning post from the qualifying solution record"
+check "$(echo "$BG" | jq -r '.learning[0].post.slug')" "${DAY}-learning-t1" "learning slug"
+check "$(echo "$BG" | jq -r '.learning[0].post.id')" "$LID" "learning id is uuid5"
+check "$(echo "$BG" | jq -r '.learning[0].post.source_event_ids | index("00000000-0000-4000-8000-00000000a002") != null')" "true" "learning cites the solution record (a002)"
+check "$(echo "$BG" | jq -r '.learning[0].post.markdown | contains("## 参考")')" "true" "learning uses the fixed section structure"
+BG2=$(req POST /v1/blog/generate "{\"date\":\"${DAY}\"}")
+check "$(echo "$BG2" | jq -r .summary.generated)" "false" "re-POST without force is idempotent (summary)"
+check "$(echo "$BG2" | jq -r .summary.post.id)" "$SUMID" "idempotent re-POST keeps the uuid5 id"
+check "$(echo "$BG2" | jq -r '[.learning[].generated] | join(",")')" "false" "re-POST keeps learning as-is"
+BG3=$(req POST /v1/blog/generate "{\"date\":\"${DAY}\",\"force\":true}")
+check "$(echo "$BG3" | jq -r .summary.generated)" "true" "force=true regenerates the summary"
+check "$(echo "$BG3" | jq -r .summary.post.id)" "$SUMID" "force keeps the same uuid5 id (summary)"
+check "$(echo "$BG3" | jq '.learning | length')" "1" "force replaces learning (same deterministic set)"
+BGD=$(req POST /v1/blog/generate "{\"date\":\"${D2}\"}")
+check "$(echo "$BGD" | jq -r .summary.generated)" "true" "D2 summary generated"
+check "$(echo "$BGD" | jq '.learning | length')" "0" "no qualifying material -> 0 learning posts"
+LP=$(req GET "/v1/blog/posts")
+check "$(echo "$LP" | jq '.posts | length')" "3" "list shows all 3 posts"
+check "$(echo "$LP" | jq -r '.posts[0].slug')" "${D2}-summary" "list is newest-first"
+check "$(echo "$(req GET '/v1/blog/posts?type=learning')" | jq '.posts | length')" "1" "type filter"
+check "$(echo "$(req GET "/v1/blog/posts?q=${D2}")" | jq '.posts | length')" "1" "q filter (title partial match)"
+check "$(echo "$(req GET "/v1/blog/posts?q=${DAY}")" | jq '.posts | length')" "2" "q filter matches title/markdown"
+check "$(echo "$(req GET '/v1/blog/posts?tag=e2e')" | jq '.posts | length')" "1" "tag filter"
+P1=$(req GET "/v1/blog/posts?limit=2")
+CUR=$(echo "$P1" | jq -r .next_cursor)
+[ "$CUR" != "null" ] && ok "list cursor present at page boundary" || bad "list cursor missing"
+P2=$(req GET "/v1/blog/posts?limit=2&cursor=$CUR")
+check "$(echo "$P2" | jq '.posts | length')" "1" "cursor second page has the rest"
+check "$(echo "$P2" | jq -r .next_cursor)" "null" "last page has no cursor"
+D=$(req GET "/v1/blog/posts/${DAY}-summary")
+check "$(echo "$D" | jq -r '.markdown | contains("## 概要（fake）")')" "true" "detail returns full markdown"
+check "$(echo "$D" | jq -r .prev)" "null" "oldest post has no prev"
+check "$(echo "$D" | jq -r .next.slug)" "${DAY}-learning-t1" "next points at the newer learning post"
+DD=$(req GET "/v1/blog/posts/${D2}-summary")
+check "$(echo "$DD" | jq -r .prev.slug)" "${DAY}-learning-t1" "prev points at the older learning post"
+check "$(echo "$DD" | jq -r .next)" "null" "newest post has no next"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/blog/posts/does-not-exist")
+check "$CODE" "404" "unknown slug -> 404"
+TG=$(req GET "/v1/blog/tags")
+check "$(echo "$TG" | jq -r '.[] | select(.tag=="fake") | .count')" "3" "tag counts (fake on all posts)"
+check "$(echo "$TG" | jq -r '.[] | select(.tag=="e2e") | .count')" "1" "tag counts (e2e on learning)"
 
 echo
 echo "results: PASS=$PASS FAIL=$FAIL"

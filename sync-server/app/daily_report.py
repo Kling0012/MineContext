@@ -451,3 +451,8 @@ async def report_scheduler():
             " (force)" if slot else "",
             "generated" if generated else "skipped (already exists)",
         )
+        # Blog posts (P5) right after each report slot, same day and same
+        # force flag; failures are logged inside blog.run_auto (fail-soft).
+        from . import blog  # local import: blog imports this module
+
+        await asyncio.to_thread(blog.run_auto, target, tz_name, slot)

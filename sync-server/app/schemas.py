@@ -238,3 +238,80 @@ class ReportOut(BaseModel):
     # True when this call generated the report; False when an existing one
     # was returned as-is (idempotent re-POST without force).
     generated: bool = False
+
+
+class BlogGenerateIn(BaseModel):
+    """POST /v1/blog/generate request body."""
+
+    date: date
+    tz: str | None = None  # default: TZ_DEFAULT
+    # Which types to generate; default = both ("summary" and "learning").
+    types: list[str] | None = None
+    force: bool = False
+
+
+class BlogPostOut(BaseModel):
+    """Full blog post (GET /v1/blog/posts/{slug}, generate responses)."""
+
+    id: uuid.UUID
+    slug: str
+    date: date
+    type: str
+    title: str
+    excerpt: str
+    markdown: str
+    tags: list[str]
+    source_event_ids: list[uuid.UUID]
+    model: str
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class BlogPostBrief(BaseModel):
+    """List item (GET /v1/blog/posts)."""
+
+    slug: str
+    date: date
+    type: str
+    title: str
+    excerpt: str
+    tags: list[str]
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class BlogPostsPage(BaseModel):
+    posts: list[BlogPostBrief]
+    next_cursor: str | None = None
+
+
+class BlogPostRef(BaseModel):
+    slug: str
+    title: str
+
+
+class BlogPostDetail(BlogPostOut):
+    """Full post plus its neighbors (chronological: prev=older, next=newer)."""
+
+    prev: BlogPostRef | None = None
+    next: BlogPostRef | None = None
+
+
+class BlogEntryOut(BaseModel):
+    post: BlogPostOut
+    generated: bool
+
+
+class BlogGenerateOut(BaseModel):
+    date: str
+    tz: str
+    summary: BlogEntryOut | None = None
+    learning: list[BlogEntryOut] = []
+
+
+class BlogTagOut(BaseModel):
+    tag: str
+    count: int

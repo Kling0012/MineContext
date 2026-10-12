@@ -101,6 +101,22 @@ curl -s http://127.0.0.1:18741/healthz
   `LLM_PROVIDER=fake` は材料の件数だけを並べた決定的 Markdown（e2e 用）。
   バックグラウンドスケジューラ（fail-soft）が毎日 23:55（TZ_DEFAULT）にその日分を
   生成し、翌朝 06:00 に前日分を force で再生成する（深夜の作業を含めるため）。
+- ブログ（P5、`blog_posts` テーブル）: 日報の直後にその日の記事を自動生成する。
+  2 種類: `summary`（1日1本。sessions・activity/screen_summary・ai_work から
+  800〜1600 字・だ・である調・見出し2〜4個の読み物）と `learning`
+  （type が solution/cause/experiment/result/issue の ai_work と screen_summary
+  から再利用できる技術的知見を話題ごとに最大3本。背景/問題・症状/原因/対処/
+  確かめ方/参考 の固定構成で、参考には時刻と id〔memory id・コミットID等〕）。
+  すべてのプロンプトで「材料に無いことは書かない」を明示し、保存前に
+  伏せ字処理（Bearer 値・password= 等のキー値・32文字以上のキー形状トークン。
+  uuid・git sha の hex トークンは参考掲載のため保持）を正規表現で適用。
+  id=uuid5(date+type+topic)、slug=`<date>-summary` / `<date>-learning-<topic>`
+  （冪等。`force=true` で summary は同一 id で再生成、learning は同日分を入れ替え）。
+  `LLM_PROVIDER=fake` は件数のみの決定的 Markdown（e2e 用）。
+  日報スケジューラの各スロット（23:55 その日分・翌 06:00 前日分 force）の直後に
+  同じ日のブログ2種類を生成（失敗はログのみ、fail-soft）。
+  閲覧画面（`app/blog/` の静的ファイル。Claude 担当）は `/blog/` として
+  app/ui と同じ方式でマウント（ディレクトリが無ければマウントしない）。
 - agent-memory からの取り込み（P3-A、バックグラウンド）:
   `GET {AM_BASE_URL}/v1/memories`（created_at 昇順・カーソルページング、クエリの
   ISO 時刻の「+」は %2B エンコード）を読み、各記録を events に upsert する。
@@ -219,6 +235,18 @@ curl -s -X POST $B/v1/reports/daily -H 'Content-Type: application/json' \
 # 取得・一覧
 curl -s "$B/v1/reports/daily?date=2026-10-12" | jq -r .report.text
 curl -s "$B/v1/reports?from=2026-10-01T00:00:00Z&to=2026-11-01T00:00:00Z" | jq '.events[].title'
+
+# ブログ記事の生成（summary + learning。冪等。force で summary 同一 id 再生成・
+# learning 同日入替。types で単独指定も可）
+curl -s -X POST $B/v1/blog/generate -H 'Content-Type: application/json' \
+  -d '{"date":"2026-10-12","tz":"Asia/Tokyo","force":false}' \
+  | jq '{summary: {slug: .summary.post.slug, generated: .summary.generated}, learning: [.learning[].post.slug]}'
+# 一覧（新しい順。type/tag/q(title・markdown 部分一致)/from/to フィルタ・cursor）
+curl -s "$B/v1/blog/posts?type=&tag=&q=&limit=20" | jq '.posts[] | {slug,date,type,title}'
+# 全文と前後の記事
+curl -s "$B/v1/blog/posts/2026-10-12-summary" | jq '{title, prev, next}'
+# タグ別件数
+curl -s "$B/v1/blog/tags" | jq '.'
 ```
 
 ## E2E テスト
@@ -242,7 +270,11 @@ compose の e2e プロファイルサービス `--profile e2e` として起動�
 → 日別集計 stats/daily（記録の無い日が 0・tz 境界の日付・active_minutes の丸め・
 セッションの日跨ぎ分割・期間超過 422）、→ 日報 reports/daily（fake: uuid5 の id・
 meta.report_type/source_counts が timeline と一致・冪等再 POST・force 再生成・
-GET/一覧・404）、→ LLM 到達不能時の生成は 502 でサーバは継続、を curl+jq で検証し
+GET/一覧・404）、→ LLM 到達不能時の生成は 502 でサーバは継続（日報・ブログとも
+失敗時保存なし）、→ ブログ blog（fake: summary/learning の uuid5 id・slug・
+材料件数・learning は type=solution の ai_work から1本・材料が無ければ 0 本・
+冪等・force（summary 同一 id・learning 入替）・一覧（新しい順・type/tag/q
+フィルタ・cursor）・全文と前後の記事・タグ別件数・404）、を curl+jq で検証し
 PASS/FAIL を出す。
 終了時に `compose down -v` で環境を消す。
 

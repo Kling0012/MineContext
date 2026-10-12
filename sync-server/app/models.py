@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -16,7 +17,7 @@ from sqlalchemy import (
     func,
     text as sa_text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from pgvector.sqlalchemy import Vector
@@ -169,6 +170,47 @@ class ImporterState(Base):
     last_error: Mapped[str | None] = mapped_column(Text)
     imported_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=sa_text("0")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+BLOG_POST_TYPES = ("summary", "learning")
+
+
+class BlogPost(Base):
+    """A generated blog article (P5). id = uuid5(date+type+topic)."""
+
+    __tablename__ = "blog_posts"
+    __table_args__ = (
+        CheckConstraint(
+            "type IN ('summary','learning')", name="ck_blog_posts_type"
+        ),
+        Index("ix_blog_posts_date", "date"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False)
+    type: Mapped[str] = mapped_column(Text, nullable=False)
+    slug: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    excerpt: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    markdown: Mapped[str] = mapped_column(Text, nullable=False)
+    tags: Mapped[list] = mapped_column(
+        ARRAY(Text), nullable=False, server_default=sa_text("'{}'::text[]")
+    )
+    source_event_ids: Mapped[list] = mapped_column(
+        ARRAY(UUID(as_uuid=True)),
+        nullable=False,
+        server_default=sa_text("'{}'::uuid[]"),
+    )
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
