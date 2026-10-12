@@ -36,12 +36,31 @@ services:
       SESSION_JUDGE_INTERVAL: ${SESSION_JUDGE_INTERVAL:-120}
       SESSION_END_THRESHOLD: ${SESSION_END_THRESHOLD:-0.75}
       IDLE_MINUTES: ${IDLE_MINUTES:-15}
+      AM_IMPORT_ENABLED: ${AM_IMPORT_ENABLED:-1}
+      AM_BASE_URL: ${AM_BASE_URL:-}
+      AM_IMPORT_INTERVAL: ${AM_IMPORT_INTERVAL:-300}
+      AM_IMPORT_LOOKBACK_HOURS: ${AM_IMPORT_LOOKBACK_HOURS:-48}
+      AM_TIMEOUT_SEC: ${AM_TIMEOUT_SEC:-15}
       BIND_HOST: 0.0.0.0
       BIND_PORT: 8000
     ports:
       # Host-side binding defaults to localhost; set BIND_HOST to expose on
       # a tailnet interface (e.g. BIND_HOST=100.x.y.z or 0.0.0.0 on Lab).
       - "${BIND_HOST:-127.0.0.1}:${API_PORT:-18741}:8000"
+    restart: unless-stopped
+
+  # E2E only (does not start without `--profile e2e`): a fake agent-memory
+  # serving the production /v1/memories response shape, so tests never touch
+  # the real shared memory. FAKE_AM_ARGS adds "--extra" for the recovery test.
+  fake-agent-memory:
+    image: python:3.12-slim
+    profiles: ["e2e"]
+    volumes:
+      - ./scripts/fake_agent_memory.py:/app/fake_agent_memory.py:ro
+    environment:
+      FAKE_AM_ARGS: ${FAKE_AM_ARGS:-}
+    entrypoint:
+      ["sh", "-c", "python /app/fake_agent_memory.py --port 8377 --page-size 2 $FAKE_AM_ARGS"]
     restart: unless-stopped
 
 volumes:

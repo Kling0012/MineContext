@@ -28,12 +28,12 @@ uuid() { python3 -c "import uuid;print(uuid.uuid4())"; }
 
 cleanup() {
   echo "--- cleanup: compose down -v"
-  $DC down -v >/dev/null 2>&1
+  $DC --profile e2e down -v >/dev/null 2>&1
 }
 trap cleanup EXIT
 
 echo "=== 1. compose up (EMBED_PROVIDER=fake, LLM_PROVIDER=fake, short judge/idle)"
-$DC down -v >/dev/null 2>&1
+$DC --profile e2e down -v >/dev/null 2>&1
 # NOTE: env must reach `docker compose` directly (a nested sudo would env-reset it).
 if ! sudo env EMBED_PROVIDER=fake LLM_PROVIDER=fake SESSION_JUDGE_INTERVAL=3 IDLE_MINUTES=0.2 docker compose up -d --build >/dev/null 2>&1; then
   bad "docker compose up"
@@ -262,6 +262,93 @@ if [ -n "$JLOG" ]; then
 else
   bad "no judge failure log found"
 fi
+
+echo "=== 15. agent-memory import: ai_work timeline, idempotent, superseded, fail-soft"
+AM1=00000000-0000-4000-8000-00000000a001
+AM2=00000000-0000-4000-8000-00000000a002
+AM3=00000000-0000-4000-8000-00000000a003
+AM4=00000000-0000-4000-8000-00000000a004
+AM5=00000000-0000-4000-8000-00000000a005
+# fake agent-memory runs as an e2e-profile compose service (same network as
+# the api, so no host firewall is involved); page-size 2 forces cursor paging
+$DC --profile e2e up -d fake-agent-memory >/dev/null 2>&1 || bad "start fake agent-memory"
+# judge interval 600s: no judging races during this section
+if ! sudo env EMBED_PROVIDER=fake LLM_PROVIDER=fake SESSION_JUDGE_INTERVAL=600 IDLE_MINUTES=15 \
+     AM_BASE_URL=http://fake-agent-memory:8377 AM_IMPORT_INTERVAL=3 \
+     docker compose up -d api >/dev/null 2>&1; then
+  bad "recreate api with agent-memory import"
+fi
+N=0; ERR="x"
+for i in $(seq 1 40); do
+  IMP=$(curl -s "$BASE/v1/importers" || true)
+  N=$(echo "$IMP" | jq -r '.importers[] | select(.name=="agent_memory") | (.imported_count // 0)')
+  ERR=$(echo "$IMP" | jq -r '.importers[] | select(.name=="agent_memory") | (.last_error // "")')
+  [ "${N:-0}" -ge 4 ] 2>/dev/null && [ -z "$ERR" ] && break
+  sleep 1
+done
+if [ "${N:-0}" -ge 4 ] 2>/dev/null; then
+  ok "importer pulled all 4 records (page-size 2 -> cursor paging worked)"
+else
+  bad "importer did not finish (count=${N:-none} err=$ERR)"
+fi
+check "$(echo "$IMP" | jq -r '.importers[] | select(.name=="agent_memory") | .enabled')" "true" "importer reports enabled"
+check "$(echo "$IMP" | jq -r '.importers[] | select(.name=="agent_memory") | .cursor_ts != null')" "true" "importer cursor advanced"
+EVC=$(req GET "/v1/events?kind=ai_work&limit=100" | jq '[.events[] | select(.device_id | startswith("agent:"))] | length')
+check "$EVC" "4" "4 ai_work events stored from agent devices"
+am_event() { req GET "/v1/events?kind=ai_work&limit=100" | jq -c ".events[] | select(.id==\"$1\")"; }
+M1=$(am_event $AM1)
+check "$(echo "$M1" | jq -r .device_id)" "agent:claude" "memory -> device agent:claude"
+check "$(echo "$M1" | jq -r .title)" "decision · minecontext" "title from type + first tag"
+check "$(echo "$M1" | jq -r .source)" "e2e:/fake/project" "source = source.uri"
+check "$(echo "$M1" | jq -r .meta.memory_type)" "decision" "meta.memory_type kept"
+check "$(echo "$M1" | jq -r .meta.superseded_by)" "$AM4" "superseded record marked via supersedes link"
+check "$(am_event $AM2 | jq -r .device_id)" "agent:codex" "second agent -> device agent:codex"
+TL=$(req GET "/v1/timeline?date=${DAY}&tz=Asia/Tokyo")
+AWD=$(echo "$TL" | jq -r '[.items[] | select(.type=="ai_work") | select(.event.device_id | startswith("agent:"))] | length')
+check "$AWD" "3" "timeline hides superseded ai_work by default"
+ORD=$(echo "$TL" | jq -r '[.items[] | select(.type=="ai_work") | select(.event.device_id | startswith("agent:")) | .event.id] | join(",")')
+check "$ORD" "$AM2,$AM3,$AM4" "ai_work items chronological in timeline"
+DN=$(echo "$TL" | jq -r ".items[] | select(.type==\"ai_work\") | select(.event.id==\"$AM2\") | .event.device_name")
+check "$DN" "codex" "timeline ai_work carries agent device name"
+AWS=$(req GET "/v1/timeline?date=${DAY}&tz=Asia/Tokyo&include_superseded=true" | jq -r '[.items[] | select(.type=="ai_work") | select(.event.device_id | startswith("agent:"))] | length')
+check "$AWS" "4" "include_superseded=true shows all 4"
+RUN=$(curl -s -X POST "$BASE/v1/importers/agent-memory/run")
+check "$(echo "$RUN" | jq -r .ok)" "true" "manual import run ok"
+EVC2=$(req GET "/v1/events?kind=ai_work&limit=100" | jq '[.events[] | select(.device_id | startswith("agent:"))] | length')
+check "$EVC2" "4" "re-run does not duplicate (id = memory_id upsert)"
+S6=$(req POST /v1/sessions "{\"title\":\"AIの作業記録\",\"started_at\":\"$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ)\"}")
+SID6=$(echo "$S6" | jq -r .session.id)
+curl -s -X POST "$BASE/v1/importers/agent-memory/run" >/dev/null
+LNK=$(am_event $AM4 | jq -r .session_id)
+check "$LNK" "$SID6" "ai_work links to session active at its time"
+$DC --profile e2e stop fake-agent-memory >/dev/null 2>&1
+sleep 1
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/v1/importers/agent-memory/run")
+check "$CODE" "502" "manual run reports 502 while agent-memory down"
+check "$(curl -s "$BASE/healthz" | jq -r .ok)" "true" "server stays up while agent-memory down"
+ERR=""
+for i in $(seq 1 10); do
+  ERR=$(req GET /v1/importers | jq -r '.importers[] | select(.name=="agent_memory") | (.last_error // "")')
+  [ -n "$ERR" ] && break
+  sleep 1
+done
+[ -n "$ERR" ] && ok "last_error recorded while down" || bad "no last_error recorded"
+if sudo env FAKE_AM_ARGS=--extra docker compose --profile e2e up -d fake-agent-memory >/dev/null 2>&1; then
+  ok "fake agent-memory restarted with an extra record"
+else
+  bad "fake agent-memory restart failed"
+fi
+EVC3=""
+for i in $(seq 1 40); do
+  EVC3=$(req GET "/v1/events?kind=ai_work&limit=100" | jq '[.events[] | select(.device_id | startswith("agent:"))] | length')
+  ERR=$(req GET /v1/importers | jq -r '.importers[] | select(.name=="agent_memory") | (.last_error // "")')
+  [ "$EVC3" = "5" ] && [ -z "$ERR" ] && break
+  sleep 1
+done
+check "$EVC3" "5" "background import recovers after agent-memory returns"
+check "$(req GET /v1/importers | jq -r '.importers[] | select(.name=="agent_memory") | .last_success_at != null')" "true" "last_success_at set after recovery"
+AWF=$(req GET "/v1/timeline?date=${DAY}&tz=Asia/Tokyo" | jq -r '[.items[] | select(.type=="ai_work") | select(.event.device_id | startswith("agent:"))] | length')
+check "$AWF" "4" "timeline shows recovered record (superseded still hidden)"
 
 echo
 echo "results: PASS=$PASS FAIL=$FAIL"

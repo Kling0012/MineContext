@@ -177,3 +177,27 @@ class TimelineResponse(BaseModel):
     items: list[TimelineItem]
     session_totals: list[SessionTotal]
     total_minutes: float
+
+
+class ImporterOut(BaseModel):
+    name: str
+    enabled: bool = False
+    cursor_ts: datetime | None
+    last_success_at: datetime | None
+    last_error: str | None
+    imported_count: int
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ImportersPage(BaseModel):
+    importers: list[ImporterOut]
+
+
+class ImporterRunOut(BaseModel):
+    ok: bool
+    fetched: int
+    upserted: int
+    pages: int
+    cursor_ts: datetime | None

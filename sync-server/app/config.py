@@ -42,3 +42,19 @@ SESSION_JUDGE_INTERVAL = _int("SESSION_JUDGE_INTERVAL", 120)
 SESSION_END_THRESHOLD = _float("SESSION_END_THRESHOLD", 0.75)
 # Minutes without events from any device before an active session is ended as idle.
 IDLE_MINUTES = _float("IDLE_MINUTES", 15.0)
+
+
+def _bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+# agent-memory import (P3-A): pull AI work records into events as ai_work.
+AM_IMPORT_ENABLED = _bool("AM_IMPORT_ENABLED", True)
+AM_BASE_URL = os.environ.get("AM_BASE_URL", "").rstrip("/")
+AM_IMPORT_INTERVAL = _int("AM_IMPORT_INTERVAL", 300)
+# First run (no cursor yet) starts this many hours back.
+AM_IMPORT_LOOKBACK_HOURS = _float("AM_IMPORT_LOOKBACK_HOURS", 48.0)
+AM_TIMEOUT_SEC = _float("AM_TIMEOUT_SEC", 15.0)

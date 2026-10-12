@@ -15,14 +15,16 @@ from sqlalchemy import func, or_, select, text as sql_text, tuple_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from . import config
+from . import am_import, config
 from .db import engine, get_db
 from .embedding import embed_sync, embedding_worker, pending_count
+from .links import session_links_for_times
 from .models import (
     AUTO_LINK_KINDS,
     Device,
     Event,
     EVENT_KINDS,
+    ImporterState,
     SESSION_STATUSES,
     WorkSession,
 )
@@ -37,6 +39,9 @@ from .schemas import (
     EventOut,
     EventsPage,
     HealthResponse,
+    ImporterOut,
+    ImportersPage,
+    ImporterRunOut,
     SearchHit,
     SearchIn,
     SearchResponse,
@@ -61,6 +66,7 @@ async def lifespan(app: FastAPI):
     tasks = [
         asyncio.create_task(embedding_worker()),
         asyncio.create_task(session_judge_worker()),
+        asyncio.create_task(am_import.am_import_worker()),
     ]
     yield
     for task in tasks:
@@ -113,38 +119,15 @@ def _as_utc(dt: datetime) -> datetime:
 
 
 def _session_links(db: Session, events: list[EventIn]) -> dict[uuid.UUID, uuid.UUID]:
-    """Map activity/screen_summary event id -> the session active at its time.
-
-    "Active at time T" = not cancelled, started_at <= T < ended_at (or no end).
-    The latest such session wins (normally at most one by construction).
-    """
-    times = [
-        _as_utc(ev.started_at)
-        for ev in events
-        if ev.kind in AUTO_LINK_KINDS
-    ]
-    if not times:
-        return {}
-    lo, hi = min(times), max(times)
-    cands = db.scalars(
-        select(WorkSession)
-        .where(
-            WorkSession.status != "cancelled",
-            WorkSession.started_at <= hi,
-            or_(WorkSession.ended_at.is_(None), WorkSession.ended_at > lo),
-        )
-        .order_by(WorkSession.started_at.desc())
-    ).fetchall()
-    links: dict[uuid.UUID, uuid.UUID] = {}
-    for ev in events:
-        if ev.kind not in AUTO_LINK_KINDS:
-            continue
-        t = _as_utc(ev.started_at)
-        for c in cands:  # desc order: first match = latest start <= t
-            if c.started_at <= t and (c.ended_at is None or t < c.ended_at):
-                links[ev.id] = c.id
-                break
-    return links
+    """activity/screen_summary -> the session active at the event's time."""
+    return session_links_for_times(
+        db,
+        [
+            (ev.id, _as_utc(ev.started_at))
+            for ev in events
+            if ev.kind in AUTO_LINK_KINDS
+        ],
+    )
 
 
 @app.post("/v1/events:batch", response_model=BatchResult)
@@ -537,6 +520,7 @@ def cancel_session(session_id: uuid.UUID, db: Session = Depends(get_db)):
 def get_timeline(
     date_: date = Query(alias="date"),
     tz: str | None = Query(default=None),
+    include_superseded: bool = Query(default=False),
     db: Session = Depends(get_db),
 ):
     tz_name = tz or config.TZ_DEFAULT
@@ -560,11 +544,19 @@ def get_timeline(
         )
         .order_by(WorkSession.started_at.asc(), WorkSession.id.asc())
     ).fetchall()
-    rows = db.execute(
+    ev_q = (
         select(Event, Device.name)
         .join(Device, Event.device_id == Device.id, isouter=True)
         .where(Event.started_at >= window_start, Event.started_at <= window_end)
-        .order_by(Event.started_at.asc(), Event.id.asc())
+    )
+    if not include_superseded:
+        # Hide superseded ai_work records (the replacement is shown instead).
+        # astext (->>) treats both a missing key and a JSON null as NULL.
+        ev_q = ev_q.where(
+            or_(Event.kind != "ai_work", Event.meta["superseded_by"].astext.is_(None))
+        )
+    rows = db.execute(
+        ev_q.order_by(Event.started_at.asc(), Event.id.asc())
     ).fetchall()
 
     items: list[TimelineItem] = []
@@ -611,3 +603,28 @@ def get_timeline(
         session_totals=totals,
         total_minutes=round(sum(t.minutes for t in totals), 2),
     )
+
+
+# --- Importers (P3-A): agent-memory records -> ai_work events ---
+
+
+@app.get("/v1/importers", response_model=ImportersPage)
+def list_importers(db: Session = Depends(get_db)):
+    rows = db.scalars(select(ImporterState).order_by(ImporterState.name)).fetchall()
+    out = [ImporterOut.model_validate(r) for r in rows]
+    for o in out:
+        if o.name == am_import.IMPORTER_NAME:
+            o.enabled = config.AM_IMPORT_ENABLED and bool(config.AM_BASE_URL)
+    return ImportersPage(importers=out)
+
+
+@app.post("/v1/importers/agent-memory/run", response_model=ImporterRunOut)
+def run_agent_memory_import():
+    try:
+        stats = am_import.import_once()
+    except Exception as e:  # noqa: BLE001 - surface to the caller; the
+        # background worker keeps retrying regardless (fail-soft).
+        raise HTTPException(
+            status_code=502, detail=f"agent-memory import failed: {e}"
+        ) from e
+    return ImporterRunOut(ok=True, **stats)

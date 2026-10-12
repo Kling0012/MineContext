@@ -41,6 +41,11 @@ curl -s http://127.0.0.1:18741/healthz
 | `SESSION_JUDGE_INTERVAL` | `120` | 終了判定の周期（秒） |
 | `SESSION_END_THRESHOLD` | `0.75` | LLM 判定で終了扱いにする確信度のしきい値 |
 | `IDLE_MINUTES` | `15` | 全端末でイベントが無い状態がこの分数続くと idle 終了 |
+| `AM_IMPORT_ENABLED` | `1` | agent-memory からの取り込み有効/無効 |
+| `AM_BASE_URL` | 空 | agent-memory のベース URL（例 `http://<memory-host>.<tailnet>.ts.net:8377`）。空なら取り込みはアイドル |
+| `AM_IMPORT_INTERVAL` | `300` | 取り込み周期（秒） |
+| `AM_IMPORT_LOOKBACK_HOURS` | `48` | 初回（カーソル無し）の遡り時間（時） |
+| `AM_TIMEOUT_SEC` | `15` | agent-memory 通信のタイムアウト秒 |
 
 注意: `EMBED_DIM` を変えると既存 DB の vector 列と不一致になるため、
 新規ボリューム（`docker compose down -v`）で初期化すること。
@@ -69,6 +74,28 @@ curl -s http://127.0.0.1:18741/healthz
 - `events.session_id uuid null`（FK, ON DELETE SET NULL）
   - `events:batch` で受けた activity/screen_summary は、その時刻に active な
     work_session があれば自動で紐づける。
+- `importer_state(name PK, cursor_ts timestamptz, last_success_at, last_error, imported_count, updated_at)`
+  - バックグラウンド取り込み（agent-memory → ai_work イベント）の進捗管理。
+    cursor_ts は「最後に取り込んだ created_at（含む）」で、ページ単位で commit される
+    （途中失敗しても続きから再試行）。
+
+- `importer_state`（上記）: agent-memory 取り込みのカーソルと状態
+- agent-memory からの取り込み（P3-A、バックグラウンド）:
+  `GET {AM_BASE_URL}/v1/memories`（created_at 昇順・カーソルページング、クエリの
+  ISO 時刻の「+」は %2B エンコード）を読み、各記録を events に upsert する。
+  id=memory_id、kind='ai_work'、device_id='agent:<source.agent>'（devices に
+  name=<agent>, os='agent' で自動登録）、started_at=created_at、text=content、
+  title=type+先頭タグの短い見出し（例 "decision · MineContext"）、source=source.uri、
+  meta={memory_type, tags, refs, source_session, valid_from, supersedes, superseded_by}。
+  取り込み時刻帯に active な work_session があれば session_id を紐づける
+  （events:batch と同じ規則。無ければ紐づけない）。supersede された記録は
+  meta.superseded_by を付けた上で DB に残し、timeline では
+  include_superseded=false（既定）で隠す。失敗（agent-memory 停止・タイムアウト）は
+  ログと importer_state.last_error に記録するだけで次の周期で再試行する
+  （fail-soft。止まるのは取り込みだけ）。初回は AM_IMPORT_LOOKBACK_HOURS から遡る。
+  注意: api コンテナから agent-memory への経路はホストファイアウォールの影響を受ける
+  （<memory-host> は ufw の既定 DROP で、コンテナ→ホスト/テールネット IP が遮断された実績あり。
+  到達できない場合は ufw の許可か network_mode の調整が必要）。
 
 ## API 例（curl）
 
@@ -147,6 +174,15 @@ curl -s "$B/v1/sessions?from=2026-10-12T00:00:00Z&status=ended"
 # セッション別の合計時間（cancelled を除く）付き
 curl -s "$B/v1/timeline?date=2026-10-12&tz=Asia/Tokyo" | \
   jq '{total_minutes, totals: [.session_totals[]|{title,minutes,status}], items: [.items[]|{type,t,title:(.session.title // .event.title)}]}'
+# supersede された ai_work（meta.superseded_by あり）は既定で隠れる。表示するには:
+curl -s "$B/v1/timeline?date=2026-10-12&tz=Asia/Tokyo&include_superseded=true"
+
+# agent-memory 取り込み（ai_work イベント）の状態と手動実行
+curl -s $B/v1/importers
+# -> {"importers":[{"name":"agent_memory","enabled":true,"cursor_ts":"...",
+#     "last_success_at":"...","last_error":null,"imported_count":12,...}]}
+curl -s -X POST $B/v1/importers/agent-memory/run
+# -> {"ok":true,"fetched":3,"upserted":3,"pages":1,"cursor_ts":"..."}
 ```
 
 ## E2E テスト
@@ -162,7 +198,12 @@ activity/screen_summary の自動紐付け → 無関係なイベントが続く
 （終了時刻は最後の関係イベント時刻）→ 新しい宣言で旧 active が superseded →
 イベント途絶えで idle 終了 → PATCH で修正と confirmed → cancel → timeline で
 sessions・events・ai_work が時刻順に並びセッション別合計が出る → 埋め込みと LLM
-到達不能時の投入・検索・宣言の継続、を curl+jq で検証し PASS/FAIL を出す。
+到達不能時の投入・検索・宣言の継続 → 偽 agent-memory（scripts/fake_agent_memory.py を
+compose の e2e プロファイルサービス `--profile e2e` として起動、2ページ・ページサイズ2、
+同じネットワーク内なので本物には触らない）から ai_work 取り込み（タイムライン時刻順・superseded
+既定で非表示・再実行で重複なし・active セッションへ紐付け）→ 偽サーバ停止中も
+サーバは動き続け（run は 502・last_error 記録）復帰後にバックグラウンドで再取り込み、
+を curl+jq で検証し PASS/FAIL を出す。
 終了時に `compose down -v` で環境を消す。
 
 `fake` provider はテキストの単語・文字2-gram を特徴ハッシュした決定的ベクトルで、

@@ -11,6 +11,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Index,
+    Integer,
     Text,
     func,
     text as sa_text,
@@ -154,4 +155,24 @@ class EventEmbedding(Base):
     embedding = mapped_column(Vector(config.EMBED_DIM), nullable=False)
     embedded_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class ImporterState(Base):
+    """Cursor/bookkeeping for a background importer (agent-memory, P3-A)."""
+
+    __tablename__ = "importer_state"
+    name: Mapped[str] = mapped_column(Text, primary_key=True)
+    # Max created_at fetched so far (inclusive); NULL = never ran.
+    cursor_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    imported_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sa_text("0")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
     )
