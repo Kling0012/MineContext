@@ -1,0 +1,40 @@
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: sync
+      POSTGRES_PASSWORD: sync
+      POSTGRES_DB: sync
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sync -d sync"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://sync:sync@db:5432/sync
+      EMBED_PROVIDER: ${EMBED_PROVIDER:-fake}
+      EMBED_BASE_URL: ${EMBED_BASE_URL:-}
+      EMBED_MODEL: ${EMBED_MODEL:-fake-embed}
+      EMBED_DIM: ${EMBED_DIM:-1024}
+      EMBED_API_KEY_FILE: ${EMBED_API_KEY_FILE:-}
+      EMBED_INTERVAL_SEC: ${EMBED_INTERVAL_SEC:-5}
+      TZ_DEFAULT: ${TZ_DEFAULT:-Asia/Tokyo}
+      BIND_HOST: 0.0.0.0
+      BIND_PORT: 8000
+    ports:
+      # Host-side binding defaults to localhost; set BIND_HOST to expose on
+      # a tailnet interface (e.g. BIND_HOST=100.x.y.z or 0.0.0.0 on Lab).
+      - "${BIND_HOST:-127.0.0.1}:${API_PORT:-18741}:8000"
+    restart: unless-stopped
+
+volumes:
+  db-data:

@@ -1,0 +1,129 @@
+# MineContext sync-server
+
+複数端末（Mac/Windows）の MineContext 作業記録（イベント）を集約し、
+時系列参照とハイブリッド検索（pgvector + pg_trgm）を提供する中央サーバ。
+認証なし（tailnet 内限定運用を想定）。
+
+## 構成
+
+- Python 3.12 / FastAPI / SQLAlchemy 2 + psycopg 3 / Alembic
+- PostgreSQL 17 + pgvector（`pgvector/pgvector:pg17` イメージ、拡張 `vector` `pg_trgm`）
+- docker-compose.yml: `db` と `api` の2サービス。api は起動時に `alembic upgrade head` を自動実行。
+- 依存は `pyproject.toml` + `uv.lock` で固定（Docker ビルドも lock ファイルから）。
+
+## 起動方法（このリポジトリ）
+
+```sh
+cd sync-server
+# 開発用（決定的な疑似埋め込み、外部通信なし）
+sudo docker compose up -d --build
+curl -s http://127.0.0.1:18741/healthz
+```
+
+環境変数（compose 経由。既定値は docker-compose.yml 参照）:
+
+| 変数 | 既定 | 説明 |
+|---|---|---|
+| `API_PORT` | `18741` | ホスト側ポート |
+| `BIND_HOST` | `127.0.0.1` | ホスト側バインド（tailnet で公開する場合は tailscale IP 等） |
+| `EMBED_PROVIDER` | `fake` | `fake`（開発用・決定的・外部通信なし）または `openai_compat` |
+| `EMBED_BASE_URL` | 空 | OpenAI 互換のベース URL（`.../v1` まで）。`openai_compat` 時必須 |
+| `EMBED_MODEL` | `fake-embed` | 埋め込みモデル名 |
+| `EMBED_DIM` | `1024` | 埋め込み次元。**マイグレーション時に vector 列の次元として固定される** |
+| `EMBED_API_KEY_FILE` | 空 | API キーのファイルパス（秘密はファイル参照のみ） |
+| `EMBED_INTERVAL_SEC` | `5` | バックグラウンド埋め込みの周期 |
+| `TZ_DEFAULT` | `Asia/Tokyo` | `GET /v1/days/{date}` の tz 既定値 |
+
+注意: `EMBED_DIM` を変えると既存 DB の vector 列と不一致になるため、
+新規ボリューム（`docker compose down -v`）で初期化すること。
+
+## データモデル
+
+- `devices(id PK, name, os, last_seen_at)`
+- `events(id UUID PK=クライアント生成, device_id FK, kind, started_at, ended_at, app, title, text, meta jsonb, source, created_at, updated_at)`
+  - kind は `activity|screen_summary|note|todo|ai_work|report` のみ（CHECK 制約）
+  - インデックス: started_at / (device_id, started_at) / kind / GIN(text gin_trgm_ops) / GIN(meta)
+- `event_embeddings(event_id PK FK CASCADE, model, embedding vector(EMBED_DIM), embedded_at)`
+  - 埋め込みキューは持たず、「event_embeddings に無い events」を未処理とみなしてバックグラウンドで埋め込み。
+    失敗しても events の保存・検索は止まらない（fail-soft。次の周期で再試行）。
+
+## API 例（curl）
+
+時刻は ISO8601 タイムゾーン付き。レスポンスの時刻は UTC (Z)。
+
+```sh
+B=http://127.0.0.1:18741
+
+# ヘルスチェック
+curl -s $B/healthz
+# -> {"ok":true,"db":"ok","embed_pending":0}
+
+# 端末登録（upsert。last_seen_at 更新）
+curl -s -X PUT $B/v1/devices/mac-1 -H 'Content-Type: application/json' \
+  -d '{"name":"MacBook Pro","os":"darwin"}'
+
+# イベント一括投入（最大500。id 冪等 upsert: 同じ id は内容更新）
+curl -s -X POST "$B/v1/events:batch" -H 'Content-Type: application/json' -d '{
+  "device_id":"mac-1",
+  "events":[{
+    "id":"0192a0c0-0000-7000-8000-000000000001",
+    "kind":"note",
+    "started_at":"2026-10-12T09:00:00+09:00",
+    "ended_at":"2026-10-12T09:30:00+09:00",
+    "app":"Obsidian",
+    "title":"週次メモ",
+    "text":"四半期財務レポートのレビューをした",
+    "meta":{"project":"minecontext"},
+    "source":"obsidian-plugin"
+  }]
+}'
+# -> {"accepted":1,"updated":0}   accepted=新規挿入, updated=同一id更新
+
+# 一覧（started_at 昇順、カーソルページング）
+curl -s "$B/v1/events?from=2026-10-12T00:00:00Z&device_id=mac-1&kind=note&limit=100"
+curl -s "$B/v1/events?limit=100&cursor=<next_cursor>"
+
+# ある日の全端末の時系列（端末名付き）と kind 別件数
+curl -s "$B/v1/days/2026-10-12?tz=Asia/Tokyo" | jq '.counts, [.events[]|{t:.started_at,d:.device_name,txt:.text}]'
+
+# ハイブリッド検索（pgvector cosine 上位50 と pg_trgm similarity 上位50 を RRF k=60 で統合）
+# 埋め込み無しのイベントも trgm 側で拾う。各結果に score と根拠（vector_rank / trgm_rank）付き。
+curl -s -X POST $B/v1/search -H 'Content-Type: application/json' -d '{
+  "query":"財務レポート",
+  "from":"2026-10-01T00:00:00Z", "to":"2026-11-01T00:00:00Z",
+  "kinds":["note","report"], "device_ids":["mac-1"], "k":20
+}'
+
+# 削除（単体のみ）
+curl -s -X DELETE $B/v1/events/0192a0c0-0000-7000-8000-000000000001
+```
+
+## E2E テスト
+
+```sh
+sudo ./scripts/e2e.sh
+```
+
+docker compose up（fake）→ healthz → 端末2台登録 → 2台分イベント投入（ja/en、
+同 id 再投入で更新）→ days で時系列・件数 → カーソルページング → 検索（日本語部分一致と
+ベクトル側一致）→ 削除 → 埋め込み失敗時の投入・検索継続、を curl+jq で検証し
+PASS/FAIL を出す。終了時に `compose down -v` で環境を消す。
+
+`fake` provider はテキストの単語・文字2-gram を特徴ハッシュした決定的ベクトルで、
+「意味検索」は n-gram 共有による近似（外部通信なし）。本番相当の意味検索には
+`openai_compat` で実埋め込みモデルを指定すること。
+
+## Lab（tailnet 内 Linux）への移行手順 — 未実施
+
+以下は想定手順のメモであり、**今回実施していない**（Lab には触っていない）。
+
+1. Lab にこのディレクトリをコピー（git 管理後 `git pull` か scp）。
+2. `docker compose` と pgvector イメージが動くことを確認。
+3. ホスト側バインドを tailnet に向ける: `BIND_HOST=<tailscale IP> API_PORT=18741 docker compose up -d --build`
+   （認証はないため、tailscale/ファイアウォール以外で公開しないこと）。
+4. 実埋め込みを使う場合:
+   `EMBED_PROVIDER=openai_compat EMBED_BASE_URL=https://.../v1 EMBED_MODEL=... EMBED_DIM=<モデル次元> EMBED_API_KEY_FILE=/path/to/key`
+   を設定してから初回起動（EMBED_DIM は vector 列の次元に固定されるため、初回起動前に確定させる）。
+   API キーはファイルマウントで渡す（compose に追記が必要）。
+5. 各端末（MineContext）のアップロード先を `http://<tailscale IP>:18741` に設定。
+6. バックアップ: `db-data` ボリューム（または `pg_dump`）を定期退避。
