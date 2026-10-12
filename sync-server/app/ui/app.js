@@ -624,6 +624,17 @@ async function refreshToday() {
   await Promise.all([loadActive(), loadTimeline(), loadHeat()]);
 }
 
+window.addEventListener("hashchange", () => {
+  const name = location.hash.slice(1).replace(/[^a-z]/g, "");
+  if (document.querySelector(`.view[data-view="${name}"]`)) showTab(name);
+});
+
+// 埋め込み時は内容の高さを親（デスクトップアプリ）へ知らせる
+if (document.documentElement.classList.contains("embed") && window.parent !== window) {
+  const main = document.querySelector("main");
+  new ResizeObserver(() => window.parent.postMessage({ hibi: "height", h: main.offsetHeight }, "*")).observe(main);
+}
+
 // 起動
 loadHealth();
 refreshToday();

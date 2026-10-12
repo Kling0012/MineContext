@@ -2,7 +2,8 @@
 import { renderMarkdown, esc } from "../ui/md.js";
 
 const $ = (id) => document.getElementById(id);
-const KIND = { summary: "1日のまとめ", learning: "技術的な学び" };
+const KIND = { post: "記事", summary: "1日のまとめ", learning: "技術的な学び" };
+const EMBED = document.documentElement.classList.contains("embed");
 const fmtDate = (d) => {
   const [y, m, day] = d.split("-").map(Number);
   const w = "日月火水木金土"[new Date(Date.UTC(y, m - 1, day)).getUTCDay()];
@@ -81,7 +82,7 @@ async function showPost(slug) {
   // 本文先頭の見出しがタイトルと同じなら重複させない
   const body = p.markdown.replace(/^#\s+.*\n+/, (h) => (h.replace(/^#\s+/, "").trim() === p.title.trim() ? "" : h));
   $("post-body").innerHTML = renderMarkdown(body);
-  $("post-foot").innerHTML = `この日の記録：<a href="../ui/#report" data-day="${esc(p.date)}" id="to-report">日報を見る</a>${p.model ? ` · 執筆 ${esc(p.model)}` : ""}`;
+  $("post-foot").innerHTML = `この日の記録：<a href="../ui/${EMBED ? "?embed=1" : ""}#report" data-day="${esc(p.date)}" id="to-report">日報を見る</a>${p.model ? ` · 執筆 ${esc(p.model)}` : ""}`;
   $("to-report").addEventListener("click", () => localStorage.setItem("mc.reportDay", p.date));
   const nav = [];
   if (p.prev) nav.push(`<a class="prev" href="#/post/${encodeURIComponent(p.prev.slug)}"><span class="lbl">‹ 前の記事</span>${esc(p.prev.title)}</a>`);

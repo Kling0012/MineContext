@@ -18,7 +18,7 @@
   color-scheme: light dark;
 }
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not(.light) {
     --bg: #0f1115;
     --card: #171a21;
     --line: #262b35;
@@ -236,7 +236,7 @@ dialog label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); ma
 .heat-legend { display: flex; align-items: center; gap: 3px; justify-content: flex-end; margin-top: 8px; font-size: 10px; color: var(--muted); }
 .heat-legend i { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
 :root { --h0: #eceef2; --h1: #c6e9d2; --h2: #7fd19d; --h3: #35a865; --h4: #17703f; }
-@media (prefers-color-scheme: dark) { :root { --h0: #20242d; --h1: #12442a; --h2: #1a6a3e; --h3: #29a35d; --h4: #4fdc8a; } }
+@media (prefers-color-scheme: dark) { :root:not(.light) { --h0: #20242d; --h1: #12442a; --h2: #1a6a3e; --h3: #29a35d; --h4: #4fdc8a; } }
 .heat .c.l0, .heat-legend .l0 { background: var(--h0); }
 .heat .c.l1, .heat-legend .l1 { background: var(--h1); }
 .heat .c.l2, .heat-legend .l2 { background: var(--h2); }
@@ -260,3 +260,21 @@ dialog label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); ma
 .md th { background: var(--bg); font-weight: 600; }
 .md .ts { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .md pre.code { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; overflow-x: auto; font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+/* デスクトップアプリへの埋め込み（?embed=1）。上下のバーを隠し、ライトテーマに固定 */
+html.embed { color-scheme: light; }
+html.embed body { background: transparent; padding-bottom: 0; }
+html.embed .topbar, html.embed .tabbar { display: none !important; }
+html.embed main { padding: 4px 4px 16px; max-width: none; }
+html.embed .toast { bottom: 16px; }
+/* ?embed=1&only=lanes: ホーム画面用に今日のレーンだけを出す */
+html.lanes-only main { padding: 0; }
+html.lanes-only .layout { grid-template-columns: 1fr !important; }
+html.lanes-only .col-side,
+html.lanes-only .col-main > :not(.lanes-card) { display: none !important; }
+html.lanes-only .lanes-card { margin: 0; border: 0; box-shadow: none; padding: 0; background: transparent; }
+/* デスクトップでは作業宣言をホーム画面で行うので重ねて出さない */
+html.embed #declare { display: none; }
+html.embed ::-webkit-scrollbar { width: 8px; height: 8px; }
+html.embed ::-webkit-scrollbar-thumb { background: #d5d9e2; border-radius: 4px; }
+html.embed ::-webkit-scrollbar-track { background: transparent; }
