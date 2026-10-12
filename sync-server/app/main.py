@@ -628,3 +628,18 @@ def run_agent_memory_import():
             status_code=502, detail=f"agent-memory import failed: {e}"
         ) from e
     return ImporterRunOut(ok=True, **stats)
+
+
+# Management web UI for phone/iPad (static files, tailnet-only like the API).
+from pathlib import Path  # noqa: E402
+
+from fastapi.responses import RedirectResponse  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
+
+_UI_DIR = Path(__file__).parent / "ui"
+if _UI_DIR.is_dir():
+    app.mount("/ui", StaticFiles(directory=_UI_DIR, html=True), name="ui")
+
+    @app.get("/", include_in_schema=False)
+    def _root() -> RedirectResponse:
+        return RedirectResponse("/ui/")
